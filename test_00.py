@@ -2,7 +2,7 @@
 from PIL import Image, ImageDraw, ImageFont
 import random
 from torch.utils.data import Dataset, DataLoader
-from train import Net
+from train_00 import Net
 import torch
 import numpy as np
 
@@ -49,14 +49,15 @@ class CropSet(Dataset):
 if __name__ == "__main__":
     output = Image.new('L', (width, height), 255)
     char_locations = []
-    for c in range(32,127):
+    offset = 97
+    for c in range(offset,127):
         c = chr(c)
         char_im = generate(c, 'fonts/Arial.ttf')
         output, coord = add_char_image(output, char_im)
         char_locations.append((c,coord))
     print(char_locations)
     output.show()
-    crop_image(output, char_locations[65][1]).show()
+    crop_image(output, char_locations[0][1]).show()
 
     crops = [(crop_image(output, char_locations[i][1]), char_locations[i][0]) for i in range(len(char_locations))]
 
@@ -68,4 +69,4 @@ if __name__ == "__main__":
     for xb, yb in dataloader:
         zb = model(xb)
         for j,y in enumerate(yb):
-            print(y, chr(torch.argmax(zb[j])+32))
+            print(y, chr(torch.argmax(zb[j])+offset))

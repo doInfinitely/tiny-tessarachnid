@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from train import Net, SpiderSet
+from train_00 import Net, SpiderSet
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset, DataLoader
 import sys
@@ -28,7 +28,8 @@ if __name__ == "__main__":
     model.eval()
     output = Image.new('L', (width, height), 255)
     char_locations = []
-    for c in range(32,127):
+    offset = 97
+    for c in range(offset,127):
         c = chr(c)
         char_im = generate(c, 'fonts/Arial.ttf')
         output, coord = add_char_image(output, char_im)
@@ -45,10 +46,10 @@ if __name__ == "__main__":
         M = [None, None, None]
         yb = model(xb)
         for j,y in enumerate(yb):
-            val = y[72]
+            #val = y[72]
             chars = []
             for key in t:
-                if t[key]*.5 <= y[ord(key)-32]:
+                if t[key]*.5 <= y[ord(key)-offset]:
                     #if count >= 100:
                     #    sys.exit(0) 
                     chars.append(key)

@@ -9,12 +9,14 @@ from PIL import Image, ImageDraw, ImageFont
 from create_lists import *
 import random
 
-character_list = ['a', 'b', 'c', 'd','e','f','g','h','i','j',]
 character_list = create_character_list()
+#character_list = ['a', 'b', 'c', 'd','e','f','g','h','i','j']
 #print(len(character_list))
 font_list = ['fonts/Arial.ttf', 'fonts/Bodoni 72.ttc']
+#font_list = ["fonts/Arial.ttf"]*4 + ['fonts/Bodoni 72.ttc']*4
 #font_list = create_font_list()
 augmentation_set = {None}
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class SpiderSet(Dataset):
     def __init__(self, char_list, font_list, aug_set):
@@ -71,21 +73,22 @@ class SpiderSet2(Dataset):
         pre_w, pre_h = font.getsize(prefix)
         x = (image_size - font_width)//2
         y = (image_size - font_height)//2
-        offset_x = 0#random.randint(-x,image_size-x-font_width) 
-        offset_y = random.randint(-y,image_size-y-font_height) 
+        offset_x = 0#random.randint(-x,image_size-x-font_width)
+        offset_y = 0#random.randint(-y,image_size-y-font_height) 
         draw.text((x-pre_w+offset_x,y+offset_y), word, 0, font=font)
         #char_image.show()
-        return torch.from_numpy(np.array(char_image)).unsqueeze(0)/255
+        return (torch.from_numpy(np.array(char_image)).unsqueeze(0)/255).to(device)
     def __len__(self):
         return len(self.char_list)*len(font_list)
     def __getitem__(self, idx):
         font_i = idx//len(self.char_list)
         char_i = idx%len(self.char_list)
         fixes = [x+y for x in self.char_list for y in self.char_list]
+        fixes = ["  "]
         prefix = random.choice(fixes)
         suffix = random.choice(fixes)
         output = self.generate(self.char_list[char_i], prefix, suffix, self.font_list[font_i])
-        return output, char_i
+        return output, torch.from_numpy(np.array(char_i)).to(device)
         
 
 '''
@@ -111,11 +114,12 @@ class Net(nn.Module):
         return x
 '''
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, char_list):
         super().__init__()
-        self.conv_layer_sizes = [1, 128]
-        self.fc_layer_sizes = [1024, 512, 128, 95]
-        conv_size = 32
+        self.conv_layer_sizes = [1, 32, 32, 32]
+        self.fc_layer_sizes = [1024, 512, 128, len(char_list)]
+        #self.fc_layer_sizes = [1024, 10]
+        conv_size = 8
         self.convs = nn.ModuleList()
         for i in range(len(self.conv_layer_sizes)-1):
             self.convs.append(nn.Conv2d(self.conv_layer_sizes[i], self.conv_layer_sizes[i+1], conv_size))
@@ -139,7 +143,7 @@ class Net(nn.Module):
             x = y(x)
             if j == len(self.fcs)-1:
                 break
-            x = F.relu(x)
+            x = F.tanh(x)
         return x
 def loss_batch(model, loss_func, xb, yb, opt=None):
     loss = loss_func(model(xb), yb)
@@ -155,7 +159,7 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl=None):
     for epoch in range(epochs):
         model.train()
         for xb, yb in train_dl:
-            print(loss_batch(model, loss_fn, xb, yb, opt))
+            loss_batch(model, loss_fn, xb, yb, opt)
 
         if valid_dl is None:
             continue
@@ -173,10 +177,11 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl=None):
 if __name__ == "__main__":
     dataset = SpiderSet2(character_list, font_list)
     #dataset = SpiderSet(character_list, font_list, augmentation_set)
-    dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
-    model = Net()
+    dataloader = DataLoader(dataset, batch_size=len(dataset), shuffle=True)
+    model = Net(character_list)
+    model.to(device)
     loss_fn = nn.CrossEntropyLoss()
-    opt = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    opt = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
     fit(1000, model, loss_fn, opt, dataloader, dataloader)
     torch.save(model.state_dict(), "model.pth")

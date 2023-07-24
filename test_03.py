@@ -1,6 +1,6 @@
 from PIL import Image, ImageFont, ImageDraw
 
-from train import Net
+from train_00 import Net
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pickle
@@ -28,21 +28,24 @@ class CarveSet(Dataset):
 def draw_word(word, font_path):
     font = ImageFont.truetype(font_path, 48)
     w, h = font.getsize(word)
-    output = Image.new("L", ( w+64*2, 96), 255)
+    output = Image.new("L", ( w+64*2, 128), 255)
     draw = ImageDraw.Draw(output)
     draw.text((64,32), word, 0, font=font)
     return output
 
-model = Net()
+character_list = ['a','b','c','d','e','f','g','h','i','j']
+character_list = create_character_list()
+model = Net(character_list)
 model.load_state_dict(torch.load("model.pth"))
 model.eval()
-img = draw_word("hello", 'fonts/Arial.ttf')
+img = draw_word("elephant", 'fonts/Bodoni 72.ttc')
 img.show()
 dataset = CarveSet(img)
 dataloader = DataLoader(dataset, batch_size=128, shuffle=False)
 t = pickle.load(open('thresholds.p','rb'))
-
+offset = 32
 lookup = dict()
+by_max = []
 for xb, zb in dataloader:
     try:
         lookup = pickle.load(open('lookup.p','rb'))
@@ -51,23 +54,24 @@ for xb, zb in dataloader:
         pass
     yb = model(xb)
     for j,y in enumerate(yb):
-        val = y[72]
+        #val = y[72]
         chars = []
         maxi = torch.argmax(y)
-        if y[maxi] > t[chr(maxi+32)]*0.9:
-            chars.append(chr(maxi+32))
-        '''
+        #if y[maxi] > t["a"]*0.9:
+        #if y[maxi] > t[chr(maxi+32)]*0.9:
+        #    chars.append(chr(maxi+offset))
         for key in t:
-            if t[key]*0.9 <= y[ord(key)-32]:
-            #if t[' ']*0.3 <= y[ord(key)-32]:
+            #if t[key]*0.9 <= y[ord(key)-32]:
+            if t[key]*0.5 <= y[ord(key)-offset]:
             #if 10 <= y[ord(key)-32]:
                 chars.append(key)
-        '''
         if len(chars):
             #Image.fromarray((xb[j]*255).squeeze(0).numpy()).show()
             rect = dataset.get_rect(zb[j])
             print(rect, chars)
             lookup[rect] = chars
+        if chr(maxi+offset) != ' ':
+            by_max.append((y[maxi], chr(maxi+offset), dataset.get_rect(zb[j])))
 pickle.dump(lookup,open('lookup.p', 'wb'))
 
 print("finding h")
@@ -77,7 +81,6 @@ for rect in lookup:
         h_set.add(rect)
 
 print(h_set)
-
 # determines if a given rectangle is within another
 # format (left, top, right, bottom)
 def contains(container, containee):
@@ -85,8 +88,8 @@ def contains(container, containee):
         if container[2] >= containee[2] and container[3] >= containee[3]:
             return True
     return False
-
 # search for e next to h
+'''
 for rect in h_set:
     print('h', rect)
     e_set = set()
@@ -96,7 +99,7 @@ for rect in h_set:
             if 'e' in lookup[key]:
                 e_set.add(key)
     print('e', e_set)
-
+'''
 def search_for_next(letter_rect, next_letter, lookup):
     letter_set = set()
     search_box = (letter_rect[0],letter_rect[1]-64,letter_rect[2]+64,letter_rect[3]+64)
@@ -147,11 +150,11 @@ def rect_of_overlap(rect1, rect2):
 
 def area(rect):
     return (rect[3]-rect[1])*(rect[2]-rect[0])
-
+'''
 for rect1 in h_set:
     for rect2 in h_set:
         print(rect1, rect2, area(rect_of_overlap(rect1,rect2)))
-
+'''
 def connected_components(box_set, overlap_threshold):
     components = [{x,} for x in box_set]
     while True:
@@ -227,14 +230,13 @@ def search_for_word_2(word, lookup):
             output.add((rect,)+x)
     return output
 
-box_sequences = search_for_word_2("hello", lookup)
-print(box_sequences)
-'''
+box_sequences = search_for_word_2("phant", lookup)
+print('box sequences', box_sequences)
+print(search_for_word_2("phaze", lookup))
 for x in box_sequences:
     for y in x:
         img.crop(y).show()
     break
-'''
 #character_list = create_character_list
 reverse_lookup = dict()
 for key in lookup:
@@ -256,6 +258,11 @@ for key in ['r','h']:
         components = connected_components(letter_set, .9)
         print(key, [len(x) for x in components])
 '''
-letter = 'o'
+'''
+letter = 'e'
 for box in reverse_lookup[letter]:
     img.crop(box).show()
+'''
+#by_max = sorted(by_max, reverse=True)
+#img.crop(by_max[0][2]).show()
+#print(by_max)
