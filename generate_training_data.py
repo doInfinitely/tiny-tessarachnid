@@ -28,6 +28,7 @@ import argparse
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 from PIL import Image, ImageDraw, ImageFont
 
 from create_lists import create_character_list
@@ -43,6 +44,39 @@ CHAR_CLASS_OFFSET = 3  # class_id = ord(char) - 32 + CHAR_CLASS_OFFSET
 
 PRINTABLE_CHARS = create_character_list()  # chr(32)..chr(126)
 PREV_BBOX_NONE = (0, 0, 0, 0, CLASS_NONE)
+
+
+# ---------------------------------------------------------------------------
+# Augmentation
+# ---------------------------------------------------------------------------
+def build_augmentation():
+    """Photometric augmentations only — no spatial transforms needed since
+    bbox coords are separate from the image tensor."""
+    return transforms.Compose([
+        transforms.ColorJitter(brightness=0.3, contrast=0.3,
+                               saturation=0.3, hue=0.1),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+        transforms.RandomGrayscale(p=0.1),
+    ])
+
+
+class AugmentedSubset(Dataset):
+    """Wraps a dataset subset and applies photometric augmentation to images."""
+
+    def __init__(self, subset, augmentation):
+        self.subset = subset
+        self.augmentation = augmentation
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        img_t, prev_t, target_t = self.subset[idx]
+        # img_t is CHW float [0,1] — convert to PIL, augment, convert back
+        img_pil = transforms.ToPILImage()(img_t)
+        img_pil = self.augmentation(img_pil)
+        img_t = transforms.ToTensor()(img_pil)
+        return img_t, prev_t, target_t
 
 
 def char_to_class(ch):

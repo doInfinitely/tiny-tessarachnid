@@ -341,6 +341,9 @@ def main():
     parser.add_argument("--page-height", type=int, default=2800)
     parser.add_argument("--max-detect", type=int, default=200)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--backbone", type=str, default="resnet50",
+                        choices=["resnet18", "resnet34", "resnet50"],
+                        help="ResNet backbone (must match checkpoint)")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -350,7 +353,7 @@ def main():
     print(f"Device: {device}")
 
     # Load model (strict=False allows loading pre-mask-head checkpoints)
-    model = RetinaOCRNet().to(device)
+    model = RetinaOCRNet(backbone=args.backbone).to(device)
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
     checkpoint = _remap_old_backbone_keys(checkpoint)
     missing, unexpected = model.load_state_dict(checkpoint, strict=False)
