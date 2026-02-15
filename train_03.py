@@ -23,7 +23,9 @@ from generate_training_data import (
     CLASS_NONE,
     CLASS_PARAGRAPH,
     CLASS_LINE,
+    CLASS_WORD,
     CHAR_CLASS_OFFSET,
+    NUM_CLASSES,
     RETINA_SIZE,
     PREV_BBOX_NONE,
     SyntheticPage,
@@ -34,7 +36,7 @@ from generate_training_data import (
     class_to_label,
 )
 from annotate_real import load_annotations
-from train_02 import NUM_CLASSES, _remap_old_backbone_keys
+from train_02 import _remap_old_backbone_keys
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +109,9 @@ class RetinaOCRGPT(nn.Module):
         self.img_proj = nn.Linear(512, d_model)
 
         # --- Detection token embedding ---
-        self.det_proj = nn.Linear(5, d_model)
+        self.det_proj = nn.Linear(6, d_model)  # (x1,y1,x2,y2,class_id,is_handwritten)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        self.level_emb = nn.Embedding(3, d_model)  # 0=para, 1=line, 2=char
+        self.level_emb = nn.Embedding(4, d_model)  # 0=para, 1=line, 2=word, 3=char
 
         # --- GPT-2 transformer ---
         self.blocks = nn.ModuleList([
@@ -130,6 +132,11 @@ class RetinaOCRGPT(nn.Module):
             nn.ReLU(),
             nn.Linear(64, NUM_CLASSES),
         )
+        self.handwritten_head = nn.Sequential(
+            nn.Linear(d_model, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
 
     def _encode_image(self, img):
         """Encode image through frozen/unfrozen ResNet-18 backbone."""
@@ -147,23 +154,27 @@ class RetinaOCRGPT(nn.Module):
         """
         Args:
             img:          (B, 3, 1024, 1024) input image
-            prev_seq:     (B, S, 5) detection sequence (x1,y1,x2,y2,class_id)
-            level_ids:    (B,) level index (0=para, 1=line, 2=char)
+            prev_seq:     (B, S, 6) detection sequence
+                          (x1,y1,x2,y2,class_id,is_handwritten)
+            level_ids:    (B,) level index (0=para, 1=line, 2=word, 3=char)
             padding_mask: (B, S) bool — True where padded
 
         Returns:
-            bbox_pred:  (B, S, 4) in retina coords
-            class_pred: (B, S, 98) logits
+            bbox_pred:        (B, S, 4) in retina coords
+            class_pred:       (B, S, NUM_CLASSES) logits
+            handwritten_pred: (B, S, 1) logits (sigmoid → probability)
         """
         B, S, _ = prev_seq.shape
 
         # Image features: (B, d_model)
         img_feat = self._encode_image(img)
 
-        # Normalize prev_seq: coords / 1024, class / 98
+        # Normalize prev_seq: coords / 1024, class / NUM_CLASSES,
+        # is_handwritten already 0/1 so pass through
         prev_norm = prev_seq.clone()
         prev_norm[:, :, :4] = prev_norm[:, :, :4] / RETINA_SIZE
         prev_norm[:, :, 4] = prev_norm[:, :, 4] / NUM_CLASSES
+        # dim 5 (is_handwritten) is already 0/1
 
         # Detection token embeddings
         det_emb = self.det_proj(prev_norm)  # (B, S, d_model)
@@ -190,10 +201,11 @@ class RetinaOCRGPT(nn.Module):
         x = self.ln_f(x)  # (B, S, d_model)
 
         # Output heads
-        bbox_pred = self.bbox_head(x) * RETINA_SIZE  # (B, S, 4)
-        class_pred = self.class_head(x)               # (B, S, 98)
+        bbox_pred = self.bbox_head(x) * RETINA_SIZE    # (B, S, 4)
+        class_pred = self.class_head(x)                 # (B, S, NUM_CLASSES)
+        handwritten_pred = self.handwritten_head(x)     # (B, S, 1)
 
-        return bbox_pred, class_pred
+        return bbox_pred, class_pred, handwritten_pred
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +215,8 @@ class SequenceOCRDataset(Dataset):
     """Produces full detection sequences per (page, level, parent).
 
     Supports both synthetic SyntheticPage objects and real annotation dirs.
+    4-level hierarchy: paragraphs → lines → words → characters.
+    All targets are 6-dim: (x1, y1, x2, y2, class_id, is_handwritten).
     """
 
     def __init__(self, pages=None, real_dirs=None, max_seq_len=128):
@@ -224,16 +238,16 @@ class SequenceOCRDataset(Dataset):
     def _build_index(self):
         # Synthetic pages
         for pi, page in enumerate(self.pages):
-            # Para-level sequence: image=full page, items=paragraphs
             self.index.append(("synthetic", pi, "para", ()))
 
             for pai, para in enumerate(page.paragraphs):
-                # Line-level: image=para crop, items=lines
                 self.index.append(("synthetic", pi, "line", (pai,)))
 
                 for li, line in enumerate(para["lines"]):
-                    # Char-level: image=line crop, items=characters
-                    self.index.append(("synthetic", pi, "char", (pai, li)))
+                    self.index.append(("synthetic", pi, "word", (pai, li)))
+
+                    for wi, word in enumerate(line["words"]):
+                        self.index.append(("synthetic", pi, "char", (pai, li, wi)))
 
         # Real annotation pages
         for ri, (page_image, nested) in enumerate(self.real_data):
@@ -244,7 +258,10 @@ class SequenceOCRDataset(Dataset):
                 self.index.append(("real", ri, "line", (pai,)))
 
                 for li, line in enumerate(para.get("lines", [])):
-                    self.index.append(("real", ri, "char", (pai, li)))
+                    self.index.append(("real", ri, "word", (pai, li)))
+
+                    for wi, word in enumerate(line.get("words", [])):
+                        self.index.append(("real", ri, "char", (pai, li, wi)))
 
     def __len__(self):
         return len(self.index)
@@ -257,7 +274,6 @@ class SequenceOCRDataset(Dataset):
         else:
             page_image, nested = self.real_data[source_idx]
             paragraphs = nested.get("paragraphs", [])
-            # Estimate bg_color from border pixels
             from annotate_real import estimate_background_color
             bg_color = estimate_background_color(page_image)
             return page_image, paragraphs, bg_color
@@ -276,10 +292,15 @@ class SequenceOCRDataset(Dataset):
             return self._make_line_sequence(
                 page_image, paragraphs, bg_color, parent_ids[0],
             )
+        elif level == "word":
+            return self._make_word_sequence(
+                page_image, paragraphs, bg_color,
+                parent_ids[0], parent_ids[1],
+            )
         else:
             return self._make_char_sequence(
                 page_image, paragraphs, bg_color,
-                parent_ids[0], parent_ids[1],
+                parent_ids[0], parent_ids[1], parent_ids[2],
             )
 
     def _make_para_sequence(self, page_image, paragraphs, bg_color):
@@ -291,16 +312,14 @@ class SequenceOCRDataset(Dataset):
 
         for para in paragraphs:
             rb = bbox_to_retina(para["bbox"], scale, ox, oy)
-            det = (rb[0], rb[1], rb[2], rb[3], CLASS_PARAGRAPH)
+            hw = int(para.get("is_handwritten", False))
+            det = (rb[0], rb[1], rb[2], rb[3], CLASS_PARAGRAPH, hw)
             target_list.append(det)
             prev_list.append(det)
 
-        # Final target is NONE
-        target_list.append((0, 0, 0, 0, CLASS_NONE))
-        # Remove last prev (we don't need input after last target)
+        target_list.append((0, 0, 0, 0, CLASS_NONE, 0))
         prev_list = prev_list[:len(target_list)]
 
-        # Truncate to max_seq_len
         S = min(len(prev_list), self.max_seq_len)
         prev_list = prev_list[:S]
         target_list = target_list[:S]
@@ -313,7 +332,8 @@ class SequenceOCRDataset(Dataset):
 
     def _make_line_sequence(self, page_image, paragraphs, bg_color, para_idx):
         para = paragraphs[para_idx]
-        lines = para.get("lines", para.get("lines", []))
+        lines = para.get("lines", [])
+        hw = int(para.get("is_handwritten", False))
         px1, py1, px2, py2 = para["bbox"]
         img = page_image.crop((px1, py1, px2, py2))
         retina, scale, ox, oy = scale_and_pad(img, bg_color)
@@ -326,11 +346,11 @@ class SequenceOCRDataset(Dataset):
             lx1, ly1, lx2, ly2 = line["bbox"]
             local = (lx1 - px1, ly1 - py1, lx2 - px1, ly2 - py1)
             rb = bbox_to_retina(local, scale, ox, oy)
-            det = (rb[0], rb[1], rb[2], rb[3], CLASS_LINE)
+            det = (rb[0], rb[1], rb[2], rb[3], CLASS_LINE, hw)
             target_list.append(det)
             prev_list.append(det)
 
-        target_list.append((0, 0, 0, 0, CLASS_NONE))
+        target_list.append((0, 0, 0, 0, CLASS_NONE, 0))
         prev_list = prev_list[:len(target_list)]
 
         S = min(len(prev_list), self.max_seq_len)
@@ -343,11 +363,12 @@ class SequenceOCRDataset(Dataset):
 
         return img_t, prev_seq, target_seq, level_id, S
 
-    def _make_char_sequence(self, page_image, paragraphs, bg_color,
+    def _make_word_sequence(self, page_image, paragraphs, bg_color,
                             para_idx, line_idx):
         para = paragraphs[para_idx]
         line = para.get("lines", [])[line_idx]
-        chars = line.get("characters", [])
+        words = line.get("words", [])
+        hw = int(para.get("is_handwritten", False))
         lx1, ly1, lx2, ly2 = line["bbox"]
         img = page_image.crop((lx1, ly1, lx2, ly2))
         retina, scale, ox, oy = scale_and_pad(img, bg_color)
@@ -356,16 +377,15 @@ class SequenceOCRDataset(Dataset):
         prev_list = [PREV_BBOX_NONE]
         target_list = []
 
-        for ch in chars:
-            cx1, cy1, cx2, cy2 = ch["bbox"]
-            local = (cx1 - lx1, cy1 - ly1, cx2 - lx1, cy2 - ly1)
+        for word in words:
+            wx1, wy1, wx2, wy2 = word["bbox"]
+            local = (wx1 - lx1, wy1 - ly1, wx2 - lx1, wy2 - ly1)
             rb = bbox_to_retina(local, scale, ox, oy)
-            class_id = char_to_class(ch["char"])
-            det = (rb[0], rb[1], rb[2], rb[3], class_id)
+            det = (rb[0], rb[1], rb[2], rb[3], CLASS_WORD, hw)
             target_list.append(det)
             prev_list.append(det)
 
-        target_list.append((0, 0, 0, 0, CLASS_NONE))
+        target_list.append((0, 0, 0, 0, CLASS_NONE, 0))
         prev_list = prev_list[:len(target_list)]
 
         S = min(len(prev_list), self.max_seq_len)
@@ -375,6 +395,42 @@ class SequenceOCRDataset(Dataset):
         prev_seq = torch.tensor(prev_list, dtype=torch.float32)
         target_seq = torch.tensor(target_list, dtype=torch.float32)
         level_id = torch.tensor(2, dtype=torch.long)
+
+        return img_t, prev_seq, target_seq, level_id, S
+
+    def _make_char_sequence(self, page_image, paragraphs, bg_color,
+                            para_idx, line_idx, word_idx):
+        para = paragraphs[para_idx]
+        word = para.get("lines", [])[line_idx].get("words", [])[word_idx]
+        chars = word.get("characters", [])
+        hw = int(para.get("is_handwritten", False))
+        wx1, wy1, wx2, wy2 = word["bbox"]
+        img = page_image.crop((wx1, wy1, wx2, wy2))
+        retina, scale, ox, oy = scale_and_pad(img, bg_color)
+        img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
+
+        prev_list = [PREV_BBOX_NONE]
+        target_list = []
+
+        for ch in chars:
+            cx1, cy1, cx2, cy2 = ch["bbox"]
+            local = (cx1 - wx1, cy1 - wy1, cx2 - wx1, cy2 - wy1)
+            rb = bbox_to_retina(local, scale, ox, oy)
+            class_id = char_to_class(ch["char"])
+            det = (rb[0], rb[1], rb[2], rb[3], class_id, hw)
+            target_list.append(det)
+            prev_list.append(det)
+
+        target_list.append((0, 0, 0, 0, CLASS_NONE, 0))
+        prev_list = prev_list[:len(target_list)]
+
+        S = min(len(prev_list), self.max_seq_len)
+        prev_list = prev_list[:S]
+        target_list = target_list[:S]
+
+        prev_seq = torch.tensor(prev_list, dtype=torch.float32)
+        target_seq = torch.tensor(target_list, dtype=torch.float32)
+        level_id = torch.tensor(3, dtype=torch.long)
 
         return img_t, prev_seq, target_seq, level_id, S
 
@@ -389,8 +445,8 @@ def sequence_collate_fn(batch):
     img_batch = torch.stack(imgs)
     level_batch = torch.stack(levels)
 
-    prev_batch = torch.zeros(B, max_len, 5, dtype=torch.float32)
-    target_batch = torch.zeros(B, max_len, 5, dtype=torch.float32)
+    prev_batch = torch.zeros(B, max_len, 6, dtype=torch.float32)
+    target_batch = torch.zeros(B, max_len, 6, dtype=torch.float32)
     padding_mask = torch.ones(B, max_len, dtype=torch.bool)  # True = padded
 
     for i in range(B):
@@ -408,25 +464,30 @@ def sequence_collate_fn(batch):
 class SequenceLoss(nn.Module):
     """Loss for sequence predictions with padding mask."""
 
-    def __init__(self, bbox_weight=1.0, class_weight=1.0):
+    def __init__(self, bbox_weight=1.0, class_weight=1.0, hw_weight=0.5):
         super().__init__()
         self.bbox_weight = bbox_weight
         self.class_weight = class_weight
+        self.hw_weight = hw_weight
         self.cls_loss_fn = nn.CrossEntropyLoss(reduction="none")
         self.bbox_loss_fn = nn.SmoothL1Loss(reduction="none")
+        self.hw_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
 
-    def forward(self, bbox_pred, class_pred, target_seq, padding_mask):
+    def forward(self, bbox_pred, class_pred, handwritten_pred,
+                target_seq, padding_mask):
         """
         Args:
-            bbox_pred:    (B, S, 4) predicted bboxes
-            class_pred:   (B, S, 98) class logits
-            target_seq:   (B, S, 5) target (x1,y1,x2,y2,class_id)
-            padding_mask: (B, S) bool — True where padded
+            bbox_pred:        (B, S, 4) predicted bboxes
+            class_pred:       (B, S, NUM_CLASSES) class logits
+            handwritten_pred: (B, S, 1) handwritten logits
+            target_seq:       (B, S, 6) target (x1,y1,x2,y2,class_id,is_handwritten)
+            padding_mask:     (B, S) bool — True where padded
         """
         B, S, _ = class_pred.shape
-        target_class = target_seq[:, :, 4].long()       # (B, S)
-        target_bbox = target_seq[:, :, :4]               # (B, S, 4)
-        valid = ~padding_mask                             # (B, S) True where valid
+        target_class = target_seq[:, :, 4].long()        # (B, S)
+        target_bbox = target_seq[:, :, :4]                # (B, S, 4)
+        target_hw = target_seq[:, :, 5]                   # (B, S)
+        valid = ~padding_mask                              # (B, S) True where valid
 
         # Classification loss at valid positions
         cls_loss = self.cls_loss_fn(
@@ -445,8 +506,19 @@ class SequenceLoss(nn.Module):
         else:
             bbox_loss = torch.tensor(0.0, device=bbox_pred.device)
 
-        total = self.bbox_weight * bbox_loss + self.class_weight * cls_loss
-        return total, bbox_loss, cls_loss
+        # Handwritten BCE loss — only at paragraph-level positions
+        para_mask = valid & (target_class == CLASS_PARAGRAPH)  # (B, S)
+        if para_mask.any():
+            hw_logits = handwritten_pred.squeeze(-1)  # (B, S)
+            hw_loss = self.hw_loss_fn(hw_logits, target_hw)  # (B, S)
+            hw_loss = (hw_loss * para_mask.float()).sum() / para_mask.float().sum().clamp(min=1)
+        else:
+            hw_loss = torch.tensor(0.0, device=bbox_pred.device)
+
+        total = (self.bbox_weight * bbox_loss
+                 + self.class_weight * cls_loss
+                 + self.hw_weight * hw_loss)
+        return total, bbox_loss, cls_loss, hw_loss
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +567,7 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
 
         # -- Train --
         model.train()
-        train_total, train_bbox, train_cls, train_n = 0.0, 0.0, 0.0, 0
+        train_total, train_bbox, train_cls, train_hw, train_n = 0.0, 0.0, 0.0, 0.0, 0
         for img, prev_seq, target_seq, level_ids, padding_mask in train_dl:
             img = img.to(device)
             prev_seq = prev_seq.to(device)
@@ -503,9 +575,11 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
             level_ids = level_ids.to(device)
             padding_mask = padding_mask.to(device)
 
-            bbox_pred, class_pred = model(img, prev_seq, level_ids, padding_mask)
-            total, bbox_loss, cls_loss = loss_fn(
-                bbox_pred, class_pred, target_seq, padding_mask,
+            bbox_pred, class_pred, hw_pred = model(
+                img, prev_seq, level_ids, padding_mask,
+            )
+            total, bbox_loss, cls_loss, hw_loss = loss_fn(
+                bbox_pred, class_pred, hw_pred, target_seq, padding_mask,
             )
 
             total.backward()
@@ -518,15 +592,17 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
             train_total += total.item() * n
             train_bbox += bbox_loss.item() * n
             train_cls += cls_loss.item() * n
+            train_hw += hw_loss.item() * n
             train_n += n
 
         train_total /= train_n
         train_bbox /= train_n
         train_cls /= train_n
+        train_hw /= train_n
 
         # -- Validate --
         model.eval()
-        val_total, val_bbox, val_cls, val_n = 0.0, 0.0, 0.0, 0
+        val_total, val_bbox, val_cls, val_hw, val_n = 0.0, 0.0, 0.0, 0.0, 0
         with torch.no_grad():
             for img, prev_seq, target_seq, level_ids, padding_mask in valid_dl:
                 img = img.to(device)
@@ -535,30 +611,32 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
                 level_ids = level_ids.to(device)
                 padding_mask = padding_mask.to(device)
 
-                bbox_pred, class_pred = model(
+                bbox_pred, class_pred, hw_pred = model(
                     img, prev_seq, level_ids, padding_mask,
                 )
-                total, bbox_loss, cls_loss = loss_fn(
-                    bbox_pred, class_pred, target_seq, padding_mask,
+                total, bbox_loss, cls_loss, hw_loss = loss_fn(
+                    bbox_pred, class_pred, hw_pred, target_seq, padding_mask,
                 )
 
                 n = img.size(0)
                 val_total += total.item() * n
                 val_bbox += bbox_loss.item() * n
                 val_cls += cls_loss.item() * n
+                val_hw += hw_loss.item() * n
                 val_n += n
 
         val_total /= val_n
         val_bbox /= val_n
         val_cls /= val_n
+        val_hw /= val_n
 
         scheduler.step(val_total)
         cur_lr = opt.param_groups[0]["lr"]
 
         print(
             f"Epoch {epoch:3d} | "
-            f"train loss={train_total:.4f} (bbox={train_bbox:.4f} cls={train_cls:.4f}) | "
-            f"val loss={val_total:.4f} (bbox={val_bbox:.4f} cls={val_cls:.4f}) | "
+            f"train loss={train_total:.4f} (bbox={train_bbox:.4f} cls={train_cls:.4f} hw={train_hw:.4f}) | "
+            f"val loss={val_total:.4f} (bbox={val_bbox:.4f} cls={val_cls:.4f} hw={val_hw:.4f}) | "
             f"lr={cur_lr:.2e}",
             flush=True,
         )
@@ -590,7 +668,8 @@ def generate_sequence(model, source_img, bg_color, level_id, device,
     Start with PREV_BBOX_NONE, run full history through transformer each step,
     take last position prediction. Stop on CLASS_NONE.
 
-    Returns: [(source_bbox, class_id), ...]
+    Returns: [(source_bbox, class_id, is_handwritten), ...]
+    where is_handwritten is a float probability (only meaningful for paragraphs).
     """
     from infer_02 import retina_to_source
 
@@ -602,13 +681,13 @@ def generate_sequence(model, source_img, bg_color, level_id, device,
 
     level_t = torch.tensor([level_id], dtype=torch.long, device=device)
 
-    # Build sequence incrementally
+    # Build sequence incrementally (6-dim)
     seq = [list(PREV_BBOX_NONE)]
     detections = []
 
     for _ in range(max_len):
         prev_t = torch.tensor([seq], dtype=torch.float32, device=device)
-        bbox_pred, class_pred = model(img_t, prev_t, level_t)
+        bbox_pred, class_pred, hw_pred = model(img_t, prev_t, level_t)
 
         # Take last position
         class_id = class_pred[0, -1].argmax().item()
@@ -616,6 +695,7 @@ def generate_sequence(model, source_img, bg_color, level_id, device,
             break
 
         rb = bbox_pred[0, -1].tolist()
+        hw_prob = torch.sigmoid(hw_pred[0, -1, 0]).item()
         source_bbox = retina_to_source(rb, scale, ox, oy)
 
         # Clamp to image bounds
@@ -629,14 +709,15 @@ def generate_sequence(model, source_img, bg_color, level_id, device,
         if source_bbox[2] <= source_bbox[0] or source_bbox[3] <= source_bbox[1]:
             break
 
-        detections.append((source_bbox, class_id))
-        seq.append([rb[0], rb[1], rb[2], rb[3], class_id])
+        hw_flag = 1.0 if hw_prob > 0.5 else 0.0
+        detections.append((source_bbox, class_id, hw_prob))
+        seq.append([rb[0], rb[1], rb[2], rb[3], class_id, hw_flag])
 
     return detections
 
 
 def run_inference(model, image_path, output_path, device):
-    """3-level hierarchical inference on a document image."""
+    """4-level hierarchical inference on a document image."""
     from infer_02 import class_to_char
     from PIL import ImageDraw, ImageFont
 
@@ -647,43 +728,65 @@ def run_inference(model, image_path, output_path, device):
 
     model.eval()
 
-    # Level 1: detect paragraphs
+    # Level 0: detect paragraphs
     paragraphs = generate_sequence(model, page_img, bg_color, 0, device)
     print(f"Detected {len(paragraphs)} paragraphs")
 
     all_text = []
     all_lines_info = []
+    all_words_info = []
     all_chars_info = []
 
-    for pi, (para_bbox, _) in enumerate(paragraphs):
+    for pi, (para_bbox, _, hw_prob) in enumerate(paragraphs):
+        hw_label = "handwritten" if hw_prob > 0.5 else "printed"
+        print(f"  Paragraph {pi+1}: {hw_label} (p={hw_prob:.2f})")
+
         para_crop = page_img.crop(para_bbox)
 
-        # Level 2: detect lines
+        # Level 1: detect lines
         lines = generate_sequence(model, para_crop, bg_color, 1, device)
-        print(f"  Paragraph {pi+1}: {len(lines)} lines")
+        print(f"    {len(lines)} lines")
 
-        for li, (line_bbox, _) in enumerate(lines):
+        for li, (line_bbox, _, _) in enumerate(lines):
             line_crop = para_crop.crop(line_bbox)
 
-            # Level 3: detect characters
-            chars = generate_sequence(model, line_crop, bg_color, 2, device)
+            # Level 2: detect words
+            words = generate_sequence(model, line_crop, bg_color, 2, device)
 
             line_text = []
-            for char_bbox, class_id in chars:
-                if class_id >= CHAR_CLASS_OFFSET:
-                    line_text.append(class_to_char(class_id))
-                else:
-                    line_text.append("?")
-                # Map char bbox to page coords
-                page_char = (
-                    char_bbox[0] + line_bbox[0] + para_bbox[0],
-                    char_bbox[1] + line_bbox[1] + para_bbox[1],
-                    char_bbox[2] + line_bbox[0] + para_bbox[0],
-                    char_bbox[3] + line_bbox[1] + para_bbox[1],
-                )
-                all_chars_info.append(page_char)
+            for wi, (word_bbox, _, _) in enumerate(words):
+                word_crop = line_crop.crop(word_bbox)
 
-            text = "".join(line_text)
+                # Level 3: detect characters
+                chars = generate_sequence(model, word_crop, bg_color, 3, device)
+
+                word_text = []
+                for char_bbox, class_id, _ in chars:
+                    if class_id >= CHAR_CLASS_OFFSET:
+                        word_text.append(class_to_char(class_id))
+                    else:
+                        word_text.append("?")
+                    # Map char bbox to page coords
+                    page_char = (
+                        char_bbox[0] + word_bbox[0] + line_bbox[0] + para_bbox[0],
+                        char_bbox[1] + word_bbox[1] + line_bbox[1] + para_bbox[1],
+                        char_bbox[2] + word_bbox[0] + line_bbox[0] + para_bbox[0],
+                        char_bbox[3] + word_bbox[1] + line_bbox[1] + para_bbox[1],
+                    )
+                    all_chars_info.append(page_char)
+
+                line_text.append("".join(word_text))
+
+                # Map word bbox to page coords
+                page_word = (
+                    word_bbox[0] + line_bbox[0] + para_bbox[0],
+                    word_bbox[1] + line_bbox[1] + para_bbox[1],
+                    word_bbox[2] + line_bbox[0] + para_bbox[0],
+                    word_bbox[3] + line_bbox[1] + para_bbox[1],
+                )
+                all_words_info.append(page_word)
+
+            text = " ".join(line_text)
             all_text.append((pi, li, text))
 
             # Map line bbox to page coords
@@ -703,17 +806,25 @@ def run_inference(model, image_path, output_path, device):
     for pi, li, text in all_text:
         if pi != current_para:
             current_para = pi
-            print(f"Paragraph {pi+1}:")
+            hw_label = ("handwritten" if paragraphs[pi][2] > 0.5
+                        else "printed")
+            print(f"Paragraph {pi+1} [{hw_label}]:")
         print(f"  Line {li+1}: {text}")
 
     # Visualize
     vis = page_img.copy()
     draw = ImageDraw.Draw(vis)
 
-    for para_bbox, _ in paragraphs:
-        draw.rectangle(para_bbox, outline=(255, 0, 0), width=3)
+    for para_bbox, _, hw_prob in paragraphs:
+        color = (255, 0, 0)
+        draw.rectangle(para_bbox, outline=color, width=3)
+        hw_label = "HW" if hw_prob > 0.5 else "PR"
+        draw.text((para_bbox[0], max(0, para_bbox[1] - 14)),
+                  hw_label, fill=color)
     for lb in all_lines_info:
         draw.rectangle(lb, outline=(0, 0, 255), width=2)
+    for wb in all_words_info:
+        draw.rectangle(wb, outline=(255, 165, 0), width=2)  # orange
     for cb in all_chars_info:
         draw.rectangle(cb, outline=(0, 180, 0), width=1)
 
@@ -736,6 +847,8 @@ if __name__ == "__main__":
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--bbox-weight", type=float, default=1.0)
     parser.add_argument("--class-weight", type=float, default=1.0)
+    parser.add_argument("--hw-weight", type=float, default=0.5,
+                        help="Handwritten classification loss weight")
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--page-width", type=int, default=2048)
     parser.add_argument("--page-height", type=int, default=2800)
@@ -887,6 +1000,7 @@ if __name__ == "__main__":
     loss_fn = SequenceLoss(
         bbox_weight=args.bbox_weight,
         class_weight=args.class_weight,
+        hw_weight=args.hw_weight,
     ).to(device)
 
     # Train

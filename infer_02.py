@@ -24,6 +24,8 @@ from generate_training_data import (
     CHAR_CLASS_OFFSET,
     CLASS_NONE,
     CLASS_LINE,
+    CLASS_TO_CHAR,
+    CLASS_WORD,
     PREV_BBOX_NONE,
     RETINA_SIZE,
     SyntheticPage,
@@ -48,8 +50,8 @@ def retina_to_source(retina_bbox, scale, ox, oy):
 
 
 def class_to_char(class_id):
-    """Convert a character class id to the corresponding ASCII character."""
-    return chr(class_id - CHAR_CLASS_OFFSET + 32)
+    """Convert a character class id to the corresponding character."""
+    return CLASS_TO_CHAR.get(class_id, "?")
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +166,8 @@ def detect_level(model, source_img, bg_color, device, max_detections=200,
     prev_bbox = PREV_BBOX_NONE
 
     for _ in range(max_detections):
-        prev_t = torch.tensor(prev_bbox, dtype=torch.float32).unsqueeze(0).to(device)
+        # Model expects 5-dim prev_bbox (x1,y1,x2,y2,class_id); trim any extras
+        prev_t = torch.tensor(prev_bbox[:5], dtype=torch.float32).unsqueeze(0).to(device)
 
         bbox_pred, class_pred = model(img_t, prev_t)
         class_id = class_pred.argmax(dim=1).item()
@@ -207,7 +210,8 @@ def _detect_with_model_bbox(model, source_img, bg_color, device, max_detections)
     prev_bbox = PREV_BBOX_NONE
 
     for _ in range(max_detections):
-        prev_t = torch.tensor(prev_bbox, dtype=torch.float32).unsqueeze(0).to(device)
+        # Model expects 5-dim prev_bbox (x1,y1,x2,y2,class_id); trim any extras
+        prev_t = torch.tensor(prev_bbox[:5], dtype=torch.float32).unsqueeze(0).to(device)
 
         bbox_pred, class_pred = model(img_t, prev_t)
         class_id = class_pred.argmax(dim=1).item()
@@ -235,10 +239,163 @@ def _detect_with_model_bbox(model, source_img, bg_color, device, max_detections)
 
 
 # ---------------------------------------------------------------------------
+# Bottom-up character detection (Level 3 replacement)
+# ---------------------------------------------------------------------------
+def _generate_candidate_boxes(line_crop, bg_color, gap_tolerance=1):
+    """Generate character candidate boxes from a line image.
+
+    Uses column-based content regions as natural character boxes. For regions
+    wider than 1.5x the expected character width (touching chars), generates
+    overlapping sub-windows at stride expected_width // 2.
+    """
+    regions = _find_content_regions(line_crop, bg_color, gap_tolerance=gap_tolerance,
+                                    scan_axis="cols")
+    if not regions:
+        return []
+
+    # Estimate expected char width from median region width
+    widths = [r[2] - r[0] for r in regions]
+    expected_w = int(np.median(widths)) if widths else 1
+    expected_w = max(expected_w, 1)
+
+    candidates = []
+    for (x1, y1, x2, y2) in regions:
+        rw = x2 - x1
+        if rw <= expected_w * 1.5:
+            # Normal-width region — use as-is
+            candidates.append((x1, y1, x2, y2))
+        else:
+            # Wide region (touching chars) — generate overlapping sub-windows
+            stride = max(expected_w // 2, 1)
+            for sx in range(x1, x2 - expected_w + 1, stride):
+                candidates.append((sx, y1, sx + expected_w, y2))
+            # Ensure we cover the rightmost part
+            if candidates and candidates[-1][2] < x2:
+                candidates.append((x2 - expected_w, y1, x2, y2))
+
+    return candidates
+
+
+@torch.no_grad()
+def _classify_candidates_batched(model, line_crop, bg_color, candidates, device,
+                                 batch_size=32):
+    """Classify candidate character boxes in batches.
+
+    For each candidate: crop from line image, scale_and_pad to 1024x1024,
+    run model with prev_bbox=PREV_BBOX_NONE.
+
+    Returns list of (box, class_id, confidence) for non-CLASS_NONE predictions.
+    """
+    results = []
+    prev_t = torch.tensor(PREV_BBOX_NONE[:5], dtype=torch.float32).unsqueeze(0).to(device)
+
+    for i in range(0, len(candidates), batch_size):
+        batch_boxes = candidates[i:i + batch_size]
+        imgs = []
+        for (x1, y1, x2, y2) in batch_boxes:
+            crop = line_crop.crop((x1, y1, x2, y2))
+            cw, ch = crop.size
+            if cw == 0 or ch == 0:
+                continue
+            # Add padding to match pretraining distribution where characters
+            # occupy ~1/5th of the image (pad ~2x char size on each side)
+            pad_x = cw * 2
+            pad_y = ch * 2
+            padded = Image.new("RGB", (cw + pad_x * 2, ch + pad_y * 2), bg_color)
+            padded.paste(crop, (pad_x, pad_y))
+            retina, _, _, _ = scale_and_pad(padded, bg_color)
+            img_t = (
+                torch.from_numpy(np.array(retina))
+                .permute(2, 0, 1)
+                .float()
+                / 255.0
+            )
+            imgs.append((img_t, (x1, y1, x2, y2)))
+
+        if not imgs:
+            continue
+
+        img_batch = torch.stack([t for t, _ in imgs]).to(device)
+        prev_batch = prev_t.expand(img_batch.size(0), -1)
+
+        bbox_pred, class_pred = model(img_batch, prev_batch)
+
+        probs = torch.softmax(class_pred, dim=1)
+        class_ids = probs.argmax(dim=1)
+        confidences = probs.gather(1, class_ids.unsqueeze(1)).squeeze(1)
+
+        for j, (_, box) in enumerate(imgs):
+            cid = class_ids[j].item()
+            conf = confidences[j].item()
+            if cid != CLASS_NONE:
+                results.append((box, cid, conf))
+
+    return results
+
+
+def _iou(box_a, box_b):
+    """Compute intersection-over-union of two (x1, y1, x2, y2) boxes."""
+    xa = max(box_a[0], box_b[0])
+    ya = max(box_a[1], box_b[1])
+    xb = min(box_a[2], box_b[2])
+    yb = min(box_a[3], box_b[3])
+    inter = max(0, xb - xa) * max(0, yb - ya)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms(detections, iou_threshold=0.3):
+    """Non-maximum suppression on detections.
+
+    detections: list of (box, class_id, confidence)
+    Returns filtered list of (box, class_id) sorted by x1 (left-to-right).
+    """
+    if not detections:
+        return []
+
+    # Sort by confidence descending
+    dets = sorted(detections, key=lambda d: d[2], reverse=True)
+    keep = []
+
+    while dets:
+        best = dets.pop(0)
+        keep.append(best)
+        dets = [d for d in dets if _iou(best[0], d[0]) < iou_threshold]
+
+    # Sort by x1 for left-to-right reading order
+    keep.sort(key=lambda d: d[0][0])
+    return [(box, cid) for box, cid, _ in keep]
+
+
+def _detect_chars_bottom_up(model, line_crop, bg_color, device,
+                            gap_tolerance=1, iou_threshold=0.3,
+                            confidence_threshold=0.1, batch_size=32):
+    """Bottom-up character detection: candidates → classify → NMS.
+
+    Returns [(bbox, class_id), ...] in left-to-right order.
+    """
+    candidates = _generate_candidate_boxes(line_crop, bg_color,
+                                           gap_tolerance=gap_tolerance)
+    if not candidates:
+        return []
+
+    detections = _classify_candidates_batched(model, line_crop, bg_color,
+                                              candidates, device,
+                                              batch_size=batch_size)
+
+    # Filter by confidence
+    detections = [d for d in detections if d[2] >= confidence_threshold]
+
+    return _nms(detections, iou_threshold=iou_threshold)
+
+
+# ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
 def visualize(page_img, page, paragraphs, all_lines, all_chars, text_output,
-              output_path, scale=2):
+              output_path, scale=2, all_words=None):
     """Draw ground truth and detections side by side and save."""
     w, h = page_img.size
     sw, sh = w * scale, h * scale
@@ -266,14 +423,21 @@ def visualize(page_img, page, paragraphs, all_lines, all_chars, text_output,
         b = para["bbox"]
         draw.rectangle((b[0]*s, b[1]*s, b[2]*s, b[3]*s),
                         outline=(255, 0, 0), width=2*s)
+        hw_label = "HW" if para.get("is_handwritten") else "PR"
+        draw.text((b[0]*s, max(0, b[1]*s - 14*s)), hw_label,
+                  fill=(255, 0, 0), font=font)
         for line in para["lines"]:
             b = line["bbox"]
             draw.rectangle((b[0]*s, b[1]*s, b[2]*s, b[3]*s),
                             outline=(0, 0, 255), width=s)
-            for ch_data in line["characters"]:
-                b = ch_data["bbox"]
+            for word in line.get("words", []):
+                b = word["bbox"]
                 draw.rectangle((b[0]*s, b[1]*s, b[2]*s, b[3]*s),
-                                outline=(0, 180, 0), width=1)
+                                outline=(255, 165, 0), width=1)
+                for ch_data in word["characters"]:
+                    b = ch_data["bbox"]
+                    draw.rectangle((b[0]*s, b[1]*s, b[2]*s, b[3]*s),
+                                    outline=(0, 180, 0), width=1)
 
     # Labels
     draw.text((10*s, 10*s), "GROUND TRUTH", fill=(255, 255, 255), font=label_font)
@@ -305,6 +469,17 @@ def visualize(page_img, page, paragraphs, all_lines, all_chars, text_output,
             text_y = max(0, page_line[1] - font_size - 4)
             draw.text((text_x + 1, text_y + 1), text, fill=(0, 0, 0), font=font)
             draw.text((text_x, text_y), text, fill=(0, 180, 0), font=font)
+
+    # Draw word boxes in orange (if available)
+    if all_words:
+        for page_word_bbox in all_words:
+            shifted = (
+                page_word_bbox[0]*s + ox,
+                page_word_bbox[1]*s,
+                page_word_bbox[2]*s + ox,
+                page_word_bbox[3]*s,
+            )
+            draw.rectangle(shifted, outline=(255, 165, 0), width=1)
 
     for (para_bbox, line_bbox, char_bbox), class_id in all_chars:
         px1, py1 = para_bbox[0], para_bbox[1]
@@ -344,6 +519,10 @@ def main():
     parser.add_argument("--backbone", type=str, default="resnet50",
                         choices=["resnet18", "resnet34", "resnet50"],
                         help="ResNet backbone (must match checkpoint)")
+    parser.add_argument("--char-gap-tolerance", type=int, default=1)
+    parser.add_argument("--nms-iou-threshold", type=float, default=0.3)
+    parser.add_argument("--char-confidence", type=float, default=0.1)
+    parser.add_argument("--char-batch-size", type=int, default=32)
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -353,9 +532,16 @@ def main():
     print(f"Device: {device}")
 
     # Load model (strict=False allows loading pre-mask-head checkpoints)
-    model = RetinaOCRNet(backbone=args.backbone).to(device)
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
     checkpoint = _remap_old_backbone_keys(checkpoint)
+    # Infer num_classes from checkpoint to handle old (98) vs new (459) models
+    num_classes = checkpoint.get("class_head.2.bias", torch.empty(0)).shape[0]
+    if num_classes == 0:
+        num_classes = None  # fall back to default
+    kwargs = {"backbone": args.backbone}
+    if num_classes:
+        kwargs["num_classes"] = num_classes
+    model = RetinaOCRNet(**kwargs).to(device)
     missing, unexpected = model.load_state_dict(checkpoint, strict=False)
     model.eval()
     if missing:
@@ -399,9 +585,14 @@ def main():
             line_crop = para_crop.crop(line_bbox)
 
             # --- Level 3: detect characters within this line ---
-            # Use model's own bbox predictions for per-character detection
-            chars = detect_level(model, line_crop, bg_color, device, args.max_detect,
-                                 use_model_bbox=True)
+            # Bottom-up: find candidates, classify individually, NMS
+            chars = _detect_chars_bottom_up(
+                model, line_crop, bg_color, device,
+                gap_tolerance=args.char_gap_tolerance,
+                iou_threshold=args.nms_iou_threshold,
+                confidence_threshold=args.char_confidence,
+                batch_size=args.char_batch_size,
+            )
 
             line_text = []
             for char_bbox, class_id in chars:
@@ -418,7 +609,10 @@ def main():
     for pi, para in enumerate(page.paragraphs):
         print(f"Paragraph {pi+1}:")
         for li, line in enumerate(para["lines"]):
-            gt_text = "".join(ch["char"] for ch in line["characters"])
+            gt_text = " ".join(
+                "".join(ch["char"] for ch in word["characters"])
+                for word in line["words"]
+            )
             print(f"  Line {li+1}: {gt_text}")
 
     # Print detected text

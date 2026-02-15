@@ -3,20 +3,23 @@ Synthetic OCR training data generator for hierarchical retina-based detection.
 
 Generates training data for a model that operates on a fixed 1024x1024 "retina"
 and detects items sequentially: paragraphs on a page, lines in a paragraph,
-characters in a line.
+words in a line, characters in a word.
 
 Uses teacher forcing: the previous ground truth bbox is provided as model input.
 The image stays unchanged throughout the autoregressive loop — the model relies
 on prev_bbox to determine what to detect next (spatial ordering: top-to-bottom
-for paragraphs/lines, left-to-right for characters).
+for paragraphs/lines, left-to-right for words/characters).
 
 Pages use random background colors and each paragraph gets a random text color.
+Each paragraph also carries an is_handwritten flag based on the rendering font.
 
-Class tokens (98 total):
+Class tokens (~534 total, dict-based encoding):
   0     = NONE (nothing left to detect)
   1     = PARAGRAPH
   2     = LINE
-  3-97  = ASCII chars: class_id = ord(char) - 32 + 3
+  3     = WORD
+  4+    = characters via CHAR_TO_CLASS dict (~530 chars: ASCII first, then
+          Latin-1 Supplement, Latin Extended-A, Greek, math, arrows, etc.)
 """
 
 import os
@@ -40,10 +43,17 @@ RETINA_SIZE = 1024
 CLASS_NONE = 0
 CLASS_PARAGRAPH = 1
 CLASS_LINE = 2
-CHAR_CLASS_OFFSET = 3  # class_id = ord(char) - 32 + CHAR_CLASS_OFFSET
+CLASS_WORD = 3
+CHAR_CLASS_OFFSET = 4
 
-PRINTABLE_CHARS = create_character_list()  # chr(32)..chr(126)
-PREV_BBOX_NONE = (0, 0, 0, 0, CLASS_NONE)
+PRINTABLE_CHARS = create_character_list()  # ~530 chars, ASCII first
+CHAR_TO_CLASS = {ch: i + CHAR_CLASS_OFFSET for i, ch in enumerate(PRINTABLE_CHARS)}
+CLASS_TO_CHAR = {v: k for k, v in CHAR_TO_CLASS.items()}
+NUM_CLASSES = CHAR_CLASS_OFFSET + len(PRINTABLE_CHARS)
+
+# ASCII subset for synthetic text generation (fonts validated for ASCII only)
+ASCII_CHARS = [ch for ch in PRINTABLE_CHARS if 32 <= ord(ch) <= 126]
+PREV_BBOX_NONE = (0, 0, 0, 0, CLASS_NONE, 0)  # 6-dim: (x1,y1,x2,y2,class_id,is_handwritten)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +90,7 @@ class AugmentedSubset(Dataset):
 
 
 def char_to_class(ch):
-    return ord(ch) - 32 + CHAR_CLASS_OFFSET
+    return CHAR_TO_CLASS[ch]
 
 
 def class_to_label(class_id):
@@ -90,7 +100,9 @@ def class_to_label(class_id):
         return "PARA"
     if class_id == CLASS_LINE:
         return "LINE"
-    return repr(chr(class_id - CHAR_CLASS_OFFSET + 32))
+    if class_id == CLASS_WORD:
+        return "WORD"
+    return repr(CLASS_TO_CHAR.get(class_id, "?"))
 
 
 def _random_color():
@@ -106,6 +118,22 @@ def _contrasting_color(bg):
         if abs(bg_lum - fg_lum) > 80:
             return fg
     return (0, 0, 0) if bg_lum > 128 else (255, 255, 255)
+
+
+# ---------------------------------------------------------------------------
+# Font classification
+# ---------------------------------------------------------------------------
+_HANDWRITING_FONT_KEYWORDS = (
+    "Bradley Hand", "Brush Script", "Chalkduster", "Comic Sans", "Zapfino",
+    "Apple Chancery", "Trattatello", "PartyLET", "Farisi", "Snell Roundhand",
+    "SignPainter", "Segoe Script", "Kristen", "Marker Felt",
+)
+
+
+def _is_handwriting_font(font_path):
+    """Check if a font file appears to be a handwriting/script font."""
+    basename = os.path.basename(font_path)
+    return any(kw.lower() in basename.lower() for kw in _HANDWRITING_FONT_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -269,13 +297,17 @@ class SyntheticPage:
         paragraphs: list of paragraph dicts, each with:
             'bbox':  (x1,y1,x2,y2)
             'mask':  PIL Image 'L' — pixel mask for the paragraph
+            'is_handwritten': bool — True if rendered with a handwriting font
             'lines': list of line dicts, each with:
                 'bbox':  (x1,y1,x2,y2)
                 'mask':  PIL Image 'L' — pixel mask for the line
-                'characters': list of char dicts with:
+                'words': list of word dicts, each with:
                     'bbox':  (x1,y1,x2,y2)
-                    'mask':  PIL Image 'L' — pixel mask for the character
-                    'char':  str
+                    'mask':  PIL Image 'L' — pixel mask for the word
+                    'characters': list of char dicts with:
+                        'bbox':  (x1,y1,x2,y2)
+                        'mask':  PIL Image 'L' — pixel mask for the character
+                        'char':  str
     """
 
     def __init__(self, fonts, page_width=2048, page_height=2800):
@@ -290,7 +322,9 @@ class SyntheticPage:
     @staticmethod
     def _random_word(min_len=1, max_len=10):
         length = random.randint(min_len, max_len)
-        chars = [random.choice(string.ascii_letters + string.digits + string.punctuation) for _ in range(length)]
+        # Use ASCII chars without space (fonts validated for ASCII only)
+        ascii_no_space = [ch for ch in ASCII_CHARS if ch != ' ']
+        chars = [random.choice(ascii_no_space) for _ in range(length)]
         return "".join(chars)
 
     @staticmethod
@@ -349,6 +383,7 @@ class SyntheticPage:
                     lb = (x_pos, y_cursor, x_pos + tw, y_cursor + th)
 
                 # Record character bboxes (positions computed before drawing)
+                # Keep spaces with None bbox so word splitting can find them
                 char_bboxes = []
                 cx = x_pos
                 for ch in line_text:
@@ -364,7 +399,10 @@ class SyntheticPage:
                         adv = font.getsize(ch)[0]
 
                     cb_int = (int(cb[0]), int(cb[1]), int(cb[2]), int(cb[3]))
-                    if cb_int[2] > cb_int[0] and cb_int[3] > cb_int[1]:
+                    if ch == ' ':
+                        # Keep space as word separator (bbox may be zero-width)
+                        char_bboxes.append((None, ch))
+                    elif cb_int[2] > cb_int[0] and cb_int[3] > cb_int[1]:
                         char_bboxes.append((cb_int, ch))
                     cx += adv
 
@@ -377,24 +415,49 @@ class SyntheticPage:
                     y_cursor = lb[3] + line_spacing
                     continue
 
-                char_data = []
+                # Group characters into words (space = word separator)
+                words_data = []
+                current_word_chars = []
                 for cb_int, ch in char_bboxes:
-                    char_mask = _compute_mask(self.image, cb_int, self.bg_color)
-                    char_data.append({
-                        "bbox": cb_int,
-                        "mask": char_mask,
-                        "char": ch,
-                    })
+                    if ch == ' ':
+                        # Flush current word (space has None bbox)
+                        if current_word_chars:
+                            words_data.append(current_word_chars)
+                            current_word_chars = []
+                    elif cb_int is not None:
+                        char_mask = _compute_mask(self.image, cb_int, self.bg_color)
+                        current_word_chars.append({
+                            "bbox": cb_int,
+                            "mask": char_mask,
+                            "char": ch,
+                        })
+                if current_word_chars:
+                    words_data.append(current_word_chars)
 
-                if not char_data:
+                if not words_data:
                     y_cursor = lb[3] + line_spacing
                     continue
+
+                # Build word-level entries with union bboxes
+                word_entries = []
+                for word_chars in words_data:
+                    wx1 = min(c["bbox"][0] for c in word_chars)
+                    wy1 = min(c["bbox"][1] for c in word_chars)
+                    wx2 = max(c["bbox"][2] for c in word_chars)
+                    wy2 = max(c["bbox"][3] for c in word_chars)
+                    word_bbox = (wx1, wy1, wx2, wy2)
+                    word_mask = _compute_mask(self.image, word_bbox, self.bg_color)
+                    word_entries.append({
+                        "bbox": word_bbox,
+                        "mask": word_mask,
+                        "characters": word_chars,
+                    })
 
                 line_mask = _compute_mask(self.image, line_bbox, self.bg_color)
                 lines_data.append({
                     "bbox": line_bbox,
                     "mask": line_mask,
-                    "characters": char_data,
+                    "words": word_entries,
                 })
 
                 y_cursor = lb[3] + line_spacing
@@ -410,6 +473,7 @@ class SyntheticPage:
             self.paragraphs.append({
                 "bbox": para_bbox,
                 "mask": para_mask,
+                "is_handwritten": _is_handwriting_font(font_path),
                 "lines": lines_data,
             })
 
@@ -424,12 +488,12 @@ class RetinaOCRDataset(Dataset):
 
     Each sample yields (retina_image, prev_bbox, target):
       - retina_image: 3x1024x1024 RGB tensor
-      - prev_bbox:    (5,) tensor — previous ground truth (x1,y1,x2,y2,class_id)
-                      in retina coords, or (0,0,0,0,0) for the first item
-      - target:       (5,) tensor — bbox of next item + class token
+      - prev_bbox:    (6,) tensor — previous ground truth
+                      (x1,y1,x2,y2,class_id,is_handwritten) in retina coords,
+                      or (0,0,0,0,0,0) for the first item
+      - target:       (6,) tensor — bbox of next item + class token + is_handwritten
 
-    The image stays unchanged throughout the autoregressive loop. The model
-    relies on prev_bbox to determine what to detect next.
+    4-level hierarchy: paragraphs → lines → words → characters.
     """
 
     def __init__(self, pages):
@@ -449,9 +513,14 @@ class RetinaOCRDataset(Dataset):
                     self.index.append((pi, "line", (pai,), i))
 
                 for li, line in enumerate(para["lines"]):
-                    n_chars = len(line["characters"])
-                    for i in range(n_chars + 1):
-                        self.index.append((pi, "char", (pai, li), i))
+                    n_words = len(line["words"])
+                    for i in range(n_words + 1):
+                        self.index.append((pi, "word", (pai, li), i))
+
+                    for wi, word in enumerate(line["words"]):
+                        n_chars = len(word["characters"])
+                        for i in range(n_chars + 1):
+                            self.index.append((pi, "char", (pai, li, wi), i))
 
     def __len__(self):
         return len(self.index)
@@ -464,8 +533,12 @@ class RetinaOCRDataset(Dataset):
             img, prev, target = self._make_para_sample(page, item_idx)
         elif level == "line":
             img, prev, target = self._make_line_sample(page, parent_ids[0], item_idx)
+        elif level == "word":
+            img, prev, target = self._make_word_sample(
+                page, parent_ids[0], parent_ids[1], item_idx)
         else:
-            img, prev, target = self._make_char_sample(page, parent_ids[0], parent_ids[1], item_idx)
+            img, prev, target = self._make_char_sample(
+                page, parent_ids[0], parent_ids[1], parent_ids[2], item_idx)
 
         # HWC -> CHW
         img_t = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
@@ -476,20 +549,21 @@ class RetinaOCRDataset(Dataset):
     # -- paragraph level ---------------------------------------------------
     def _make_para_sample(self, page, item_idx):
         paragraphs = page.paragraphs
-
         retina, scale, ox, oy = scale_and_pad(page.image, page.bg_color)
 
         if item_idx > 0 and item_idx - 1 < len(paragraphs):
             pb = bbox_to_retina(paragraphs[item_idx - 1]["bbox"], scale, ox, oy)
-            prev = (pb[0], pb[1], pb[2], pb[3], CLASS_PARAGRAPH)
+            hw = int(paragraphs[item_idx - 1].get("is_handwritten", False))
+            prev = (pb[0], pb[1], pb[2], pb[3], CLASS_PARAGRAPH, hw)
         else:
             prev = PREV_BBOX_NONE
 
         if item_idx < len(paragraphs):
             rb = bbox_to_retina(paragraphs[item_idx]["bbox"], scale, ox, oy)
-            target = (rb[0], rb[1], rb[2], rb[3], CLASS_PARAGRAPH)
+            hw = int(paragraphs[item_idx].get("is_handwritten", False))
+            target = (rb[0], rb[1], rb[2], rb[3], CLASS_PARAGRAPH, hw)
         else:
-            target = (0, 0, 0, 0, CLASS_NONE)
+            target = (0, 0, 0, 0, CLASS_NONE, 0)
 
         return retina, prev, target
 
@@ -497,17 +571,17 @@ class RetinaOCRDataset(Dataset):
     def _make_line_sample(self, page, para_idx, item_idx):
         para = page.paragraphs[para_idx]
         lines = para["lines"]
+        hw = int(para.get("is_handwritten", False))
 
         px1, py1, px2, py2 = para["bbox"]
         img = page.image.crop((px1, py1, px2, py2))
-
         retina, scale, ox, oy = scale_and_pad(img, page.bg_color)
 
         if item_idx > 0 and item_idx - 1 < len(lines):
             lx1, ly1, lx2, ly2 = lines[item_idx - 1]["bbox"]
             local = (lx1 - px1, ly1 - py1, lx2 - px1, ly2 - py1)
             pb = bbox_to_retina(local, scale, ox, oy)
-            prev = (pb[0], pb[1], pb[2], pb[3], CLASS_LINE)
+            prev = (pb[0], pb[1], pb[2], pb[3], CLASS_LINE, hw)
         else:
             prev = PREV_BBOX_NONE
 
@@ -515,40 +589,69 @@ class RetinaOCRDataset(Dataset):
             lx1, ly1, lx2, ly2 = lines[item_idx]["bbox"]
             local = (lx1 - px1, ly1 - py1, lx2 - px1, ly2 - py1)
             rb = bbox_to_retina(local, scale, ox, oy)
-            target = (rb[0], rb[1], rb[2], rb[3], CLASS_LINE)
+            target = (rb[0], rb[1], rb[2], rb[3], CLASS_LINE, hw)
         else:
-            target = (0, 0, 0, 0, CLASS_NONE)
+            target = (0, 0, 0, 0, CLASS_NONE, 0)
+
+        return retina, prev, target
+
+    # -- word level --------------------------------------------------------
+    def _make_word_sample(self, page, para_idx, line_idx, item_idx):
+        para = page.paragraphs[para_idx]
+        line = para["lines"][line_idx]
+        words = line["words"]
+        hw = int(para.get("is_handwritten", False))
+
+        lx1, ly1, lx2, ly2 = line["bbox"]
+        img = page.image.crop((lx1, ly1, lx2, ly2))
+        retina, scale, ox, oy = scale_and_pad(img, page.bg_color)
+
+        if item_idx > 0 and item_idx - 1 < len(words):
+            wx1, wy1, wx2, wy2 = words[item_idx - 1]["bbox"]
+            local = (wx1 - lx1, wy1 - ly1, wx2 - lx1, wy2 - ly1)
+            pb = bbox_to_retina(local, scale, ox, oy)
+            prev = (pb[0], pb[1], pb[2], pb[3], CLASS_WORD, hw)
+        else:
+            prev = PREV_BBOX_NONE
+
+        if item_idx < len(words):
+            wx1, wy1, wx2, wy2 = words[item_idx]["bbox"]
+            local = (wx1 - lx1, wy1 - ly1, wx2 - lx1, wy2 - ly1)
+            rb = bbox_to_retina(local, scale, ox, oy)
+            target = (rb[0], rb[1], rb[2], rb[3], CLASS_WORD, hw)
+        else:
+            target = (0, 0, 0, 0, CLASS_NONE, 0)
 
         return retina, prev, target
 
     # -- character level ---------------------------------------------------
-    def _make_char_sample(self, page, para_idx, line_idx, item_idx):
+    def _make_char_sample(self, page, para_idx, line_idx, word_idx, item_idx):
         para = page.paragraphs[para_idx]
-        line = para["lines"][line_idx]
-        chars = line["characters"]
+        word = para["lines"][line_idx]["words"][word_idx]
+        chars = word["characters"]
+        hw = int(para.get("is_handwritten", False))
 
-        lx1, ly1, lx2, ly2 = line["bbox"]
-        img = page.image.crop((lx1, ly1, lx2, ly2))
-
+        wx1, wy1, wx2, wy2 = word["bbox"]
+        img = page.image.crop((wx1, wy1, wx2, wy2))
         retina, scale, ox, oy = scale_and_pad(img, page.bg_color)
 
         if item_idx > 0 and item_idx - 1 < len(chars):
             cx1, cy1, cx2, cy2 = chars[item_idx - 1]["bbox"]
-            local = (cx1 - lx1, cy1 - ly1, cx2 - lx1, cy2 - ly1)
+            local = (cx1 - wx1, cy1 - wy1, cx2 - wx1, cy2 - wy1)
             pb = bbox_to_retina(local, scale, ox, oy)
             prev_class = char_to_class(chars[item_idx - 1]["char"])
-            prev = (pb[0], pb[1], pb[2], pb[3], prev_class)
+            prev = (pb[0], pb[1], pb[2], pb[3], prev_class, hw)
         else:
             prev = PREV_BBOX_NONE
 
         if item_idx < len(chars):
             cx1, cy1, cx2, cy2 = chars[item_idx]["bbox"]
-            local = (cx1 - lx1, cy1 - ly1, cx2 - lx1, cy2 - ly1)
+            local = (cx1 - wx1, cy1 - wy1, cx2 - wx1, cy2 - wy1)
             rb = bbox_to_retina(local, scale, ox, oy)
             class_id = char_to_class(chars[item_idx]["char"])
-            target = (rb[0], rb[1], rb[2], rb[3], class_id)
+            target = (rb[0], rb[1], rb[2], rb[3], class_id, hw)
         else:
-            target = (0, 0, 0, 0, CLASS_NONE)
+            target = (0, 0, 0, 0, CLASS_NONE, 0)
 
         return retina, prev, target
 
@@ -576,9 +679,9 @@ class CharacterPretrainDataset(Dataset):
         for _ in range(num_samples):
             bg_color = _random_color()
             text_color = _contrasting_color(bg_color)
-            ch = random.choice(PRINTABLE_CHARS)
+            ch = random.choice(ASCII_CHARS)
             if ch == ' ':
-                ch = random.choice(PRINTABLE_CHARS[1:])  # skip space
+                ch = random.choice(ASCII_CHARS[1:])  # skip space
 
             font_path = random.choice(self.fonts)
             font_size = random.randint(18, 52)
@@ -635,14 +738,14 @@ class CharacterPretrainDataset(Dataset):
             # Model sees the same image but prev_bbox says "I just found it"
             retina, scale, ox, oy = scale_and_pad(img_orig, bg_color)
             rb = bbox_to_retina(char_bbox, scale, ox, oy)
-            prev = (rb[0], rb[1], rb[2], rb[3], class_id)
-            target = (0, 0, 0, 0, CLASS_NONE)
+            prev = (rb[0], rb[1], rb[2], rb[3], class_id, 0)
+            target = (0, 0, 0, 0, CLASS_NONE, 0)
         else:
             # Character present, prev=NONE, target=char
             retina, scale, ox, oy = scale_and_pad(img_orig, bg_color)
             prev = PREV_BBOX_NONE
             rb = bbox_to_retina(char_bbox, scale, ox, oy)
-            target = (rb[0], rb[1], rb[2], rb[3], class_id)
+            target = (rb[0], rb[1], rb[2], rb[3], class_id, 0)
 
         img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
         prev_t = torch.tensor(prev, dtype=torch.float32)
@@ -660,7 +763,8 @@ def visualize_sample(img_tensor, prev_tensor, target_tensor, path):
     draw = ImageDraw.Draw(img)
 
     # Draw previous bbox (teacher forcing input) in yellow dashed
-    px1, py1, px2, py2, pcls = [int(v) for v in prev_tensor.tolist()]
+    prev_vals = [int(v) for v in prev_tensor.tolist()]
+    px1, py1, px2, py2, pcls = prev_vals[0], prev_vals[1], prev_vals[2], prev_vals[3], prev_vals[4]
     if pcls != CLASS_NONE:
         for x in range(px1, px2, 6):
             draw.line([(x, py1), (min(x + 3, px2), py1)], fill=(200, 200, 0), width=1)
@@ -671,7 +775,8 @@ def visualize_sample(img_tensor, prev_tensor, target_tensor, path):
         draw.text((px1, max(0, py1 - 24)), f"prev:{class_to_label(pcls)}", fill=(200, 200, 0))
 
     # Draw target bbox
-    x1, y1, x2, y2, cls = [int(v) for v in target_tensor.tolist()]
+    tgt_vals = [int(v) for v in target_tensor.tolist()]
+    x1, y1, x2, y2, cls = tgt_vals[0], tgt_vals[1], tgt_vals[2], tgt_vals[3], tgt_vals[4]
 
     if cls == CLASS_NONE:
         color = (128, 128, 128)
@@ -679,6 +784,8 @@ def visualize_sample(img_tensor, prev_tensor, target_tensor, path):
         color = (255, 0, 0)
     elif cls == CLASS_LINE:
         color = (0, 0, 255)
+    elif cls == CLASS_WORD:
+        color = (255, 165, 0)  # orange
     else:
         color = (0, 180, 0)
 
@@ -717,12 +824,18 @@ if __name__ == "__main__":
     pages = []
     for i in range(args.pages):
         pages.append(SyntheticPage(fonts, args.page_width, args.page_height))
-        total_chars = sum(
-            len(line["characters"])
+        total_words = sum(
+            len(line["words"])
             for para in pages[-1].paragraphs
             for line in para["lines"]
         )
-        print(f"  Page {i}: {len(pages[-1].paragraphs)} paragraphs, {total_chars} characters, bg={pages[-1].bg_color}")
+        total_chars = sum(
+            len(word["characters"])
+            for para in pages[-1].paragraphs
+            for line in para["lines"]
+            for word in line["words"]
+        )
+        print(f"  Page {i}: {len(pages[-1].paragraphs)} paragraphs, {total_words} words, {total_chars} characters, bg={pages[-1].bg_color}")
 
     # Build dataset
     dataset = RetinaOCRDataset(pages)
@@ -738,11 +851,15 @@ if __name__ == "__main__":
         elif level == "line":
             para = page.paragraphs[parent_ids[0]]
             cls = CLASS_LINE if item_idx < len(para["lines"]) else CLASS_NONE
-        else:
+        elif level == "word":
             para = page.paragraphs[parent_ids[0]]
             line = para["lines"][parent_ids[1]]
-            if item_idx < len(line["characters"]):
-                cls = char_to_class(line["characters"][item_idx]["char"])
+            cls = CLASS_WORD if item_idx < len(line["words"]) else CLASS_NONE
+        else:
+            para = page.paragraphs[parent_ids[0]]
+            word = para["lines"][parent_ids[1]]["words"][parent_ids[2]]
+            if item_idx < len(word["characters"]):
+                cls = char_to_class(word["characters"][item_idx]["char"])
             else:
                 cls = CLASS_NONE
         label = class_to_label(cls)
@@ -774,6 +891,6 @@ if __name__ == "__main__":
     dl = DataLoader(dataset, batch_size=8, shuffle=True)
     batch_img, batch_prev, batch_tgt = next(iter(dl))
     print(f"  Image batch shape:  {batch_img.shape}")    # (8, 3, 1024, 1024)
-    print(f"  Prev batch shape:   {batch_prev.shape}")   # (8, 5)
-    print(f"  Target batch shape: {batch_tgt.shape}")     # (8, 5)
+    print(f"  Prev batch shape:   {batch_prev.shape}")   # (8, 6)
+    print(f"  Target batch shape: {batch_tgt.shape}")     # (8, 6)
     print("\nDone.")

@@ -1,22 +1,29 @@
 """
 Annotate real document images using OpenAI GPT-4o vision API.
 
-Pipeline:
-  Stage 1 — Hierarchical vision cascade (multiple GPT-4o vision calls):
-      Full page → paragraph bboxes → line bboxes → character bboxes + chars
-  Stage 2 — Flat-to-nested conversion (GPT-4o text or local fallback)
-  Stage 3 — Mask computation + output saving (local, no API)
+Two modes:
+  Flat mode (default) — Single GPT-4o vision call returning all elements:
+      paragraphs, lines, words, characters with bboxes + is_handwritten.
+      Results are spatially nested into 4-level hierarchy.
+
+  Cascade mode (--cascade) — Hierarchical vision cascade (multiple calls):
+      Full page → paragraphs → lines → words → characters.
 
 Output format matches SyntheticPage hierarchy for training integration:
-  paragraphs → lines → characters, each with bbox, mask, and char label.
+  paragraphs → lines → words → characters, each with bbox, mask, and char label.
+  Paragraphs carry an is_handwritten flag.
 
 Usage:
   .venv/bin/python annotate_real.py image1.png [image2.jpg ...] \\
       --output-dir real_annotations/ \\
       --bg-color 255,255,255 \\
-      --skip-nesting-gpt \\
-      --rate-limit-delay 0.5 \\
       --visualize
+
+  # Cascade mode (old multi-call pipeline):
+  .venv/bin/python annotate_real.py image1.png --cascade --skip-nesting-gpt
+
+  # Force handwritten label on all paragraphs:
+  .venv/bin/python annotate_real.py handwriting.png --handwritten
 """
 
 import os
@@ -34,7 +41,7 @@ from PIL import Image, ImageDraw
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from generate_training_data import _compute_mask
+from generate_training_data import CHAR_TO_CLASS, _compute_mask
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -178,6 +185,64 @@ NESTED_SCHEMA = {
             }
         },
         "required": ["paragraphs"],
+        "additionalProperties": False,
+    },
+}
+
+WORD_SCHEMA = {
+    "name": "word_detection",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "words": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "bbox": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        }
+                    },
+                    "required": ["bbox"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["words"],
+        "additionalProperties": False,
+    },
+}
+
+FLAT_ANNOTATION_SCHEMA = {
+    "name": "flat_annotation",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "annotations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["paragraph", "line", "word", "character"],
+                        },
+                        "bbox": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
+                        "char": {"type": "string"},
+                        "is_handwritten": {"type": "boolean"},
+                    },
+                    "required": ["type", "bbox", "char", "is_handwritten"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["annotations"],
         "additionalProperties": False,
     },
 }
@@ -390,24 +455,55 @@ def detect_characters(client, line_crop):
         bbox = ch.get("bbox")
         char = ch.get("char", "")
         if bbox and len(bbox) == 4 and len(char) == 1:
-            # Filter to ASCII printable
-            if 32 <= ord(char) <= 126:
+            # Filter to supported characters
+            if char in CHAR_TO_CLASS:
                 bbox = clamp_bbox([int(v) for v in bbox], w, h)
                 chars.append({"bbox": bbox, "char": char})
     log.info("    Detected %d characters", len(chars))
     return chars
 
 
-def build_flat_annotations(client, page_image, rate_limit_delay=0.5):
-    """Orchestrate the hierarchical vision cascade.
+def detect_words(client, line_crop):
+    """Detect word bounding boxes within a line crop.
 
-    Calls detect_paragraphs, then detect_lines per paragraph, then
-    detect_characters per line. Translates crop-local coords to
-    page-global coords.
+    Returns list of dicts: [{"bbox": [x1,y1,x2,y2]}, ...]
+    """
+    w, h = line_crop.size
+    system_prompt = (
+        "You are a document layout analyzer. You detect individual words "
+        "within a text line. Return precise pixel-coordinate bounding boxes."
+    )
+    user_prompt = (
+        f"Detect all words in this text line crop. Image is {w}x{h} "
+        f"pixels. Return [x1,y1,x2,y2] bboxes in left-to-right order. "
+        f"A word is a contiguous group of characters separated by spaces."
+    )
 
-    Returns flat list:
-      [{"id": int, "type": str, "bbox": [x1,y1,x2,y2], "text": str,
-        "para_idx": int, "line_idx": int|None}, ...]
+    result = call_gpt4o_vision(
+        client, line_crop, system_prompt, user_prompt,
+        WORD_SCHEMA, detail="high",
+    )
+    if result is None:
+        log.warning("Word detection failed for line crop")
+        return []
+
+    words = []
+    for wd in result.get("words", []):
+        bbox = wd.get("bbox")
+        if bbox and len(bbox) == 4:
+            bbox = clamp_bbox([int(v) for v in bbox], w, h)
+            words.append({"bbox": bbox})
+    log.info("    Detected %d words", len(words))
+    return words
+
+
+def build_cascade_annotations(client, page_image, rate_limit_delay=0.5):
+    """Orchestrate the hierarchical vision cascade (4-level).
+
+    Calls detect_paragraphs → detect_lines → detect_words → detect_characters.
+    Translates crop-local coords to page-global coords.
+
+    Returns flat list with para_idx, line_idx, word_idx tracking.
     """
     flat = []
     next_id = 0
@@ -420,8 +516,8 @@ def build_flat_annotations(client, page_image, rate_limit_delay=0.5):
         pb = para["bbox"]
         flat.append({
             "id": next_id, "type": "paragraph",
-            "bbox": pb, "text": "",
-            "para_idx": pi, "line_idx": None,
+            "bbox": pb, "text": "", "is_handwritten": False,
+            "para_idx": pi, "line_idx": None, "word_idx": None,
         })
         next_id += 1
 
@@ -434,45 +530,202 @@ def build_flat_annotations(client, page_image, rate_limit_delay=0.5):
 
         for li, line in enumerate(lines):
             lb = line["bbox"]
-            # Translate line bbox to page-global coords
             lb_global = [
                 lb[0] + pb[0], lb[1] + pb[1],
                 lb[2] + pb[0], lb[3] + pb[1],
             ]
             flat.append({
                 "id": next_id, "type": "line",
-                "bbox": lb_global, "text": "",
-                "para_idx": pi, "line_idx": li,
+                "bbox": lb_global, "text": "", "is_handwritten": False,
+                "para_idx": pi, "line_idx": li, "word_idx": None,
             })
             next_id += 1
 
             # Crop line region
             line_crop = para_crop.crop(lb)
 
-            # Detect characters within line
-            chars = detect_characters(client, line_crop)
+            # Detect words within line
+            words = detect_words(client, line_crop)
             time.sleep(rate_limit_delay)
 
-            for ch in chars:
-                cb = ch["bbox"]
-                # Translate char bbox to page-global coords
-                cb_global = [
-                    cb[0] + lb[0] + pb[0], cb[1] + lb[1] + pb[1],
-                    cb[2] + lb[0] + pb[0], cb[3] + lb[1] + pb[1],
+            for wi, word in enumerate(words):
+                wb = word["bbox"]
+                wb_global = [
+                    wb[0] + lb[0] + pb[0], wb[1] + lb[1] + pb[1],
+                    wb[2] + lb[0] + pb[0], wb[3] + lb[1] + pb[1],
                 ]
                 flat.append({
-                    "id": next_id, "type": "character",
-                    "bbox": cb_global, "text": ch["char"],
-                    "para_idx": pi, "line_idx": li,
+                    "id": next_id, "type": "word",
+                    "bbox": wb_global, "text": "", "is_handwritten": False,
+                    "para_idx": pi, "line_idx": li, "word_idx": wi,
                 })
                 next_id += 1
 
-    log.info("Built %d flat annotations total", len(flat))
+                # Crop word region
+                word_crop = line_crop.crop(wb)
+
+                # Detect characters within word
+                chars = detect_characters(client, word_crop)
+                time.sleep(rate_limit_delay)
+
+                for ch in chars:
+                    cb = ch["bbox"]
+                    cb_global = [
+                        cb[0] + wb[0] + lb[0] + pb[0],
+                        cb[1] + wb[1] + lb[1] + pb[1],
+                        cb[2] + wb[0] + lb[0] + pb[0],
+                        cb[3] + wb[1] + lb[1] + pb[1],
+                    ]
+                    flat.append({
+                        "id": next_id, "type": "character",
+                        "bbox": cb_global, "text": ch["char"],
+                        "is_handwritten": False,
+                        "para_idx": pi, "line_idx": li, "word_idx": wi,
+                    })
+                    next_id += 1
+
+    log.info("Built %d cascade annotations total", len(flat))
     return flat
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Flat-to-nested conversion
+# Flat annotation mode (default) — single GPT call
+# ---------------------------------------------------------------------------
+
+def annotate_flat(client, page_image, force_handwritten=False):
+    """Single GPT-4o vision call returning all 4 levels in a flat list.
+
+    Returns flat list of annotations with type, bbox, char, is_handwritten.
+    """
+    w, h = page_image.size
+    system_prompt = (
+        "You are a precise document layout and OCR analyzer. Given an image, "
+        "detect ALL elements at four levels: paragraphs, lines, words, and "
+        "characters. Return pixel-coordinate [x1,y1,x2,y2] bounding boxes. "
+        "For each paragraph, indicate if the text is handwritten. "
+        "For characters, provide the ASCII character. "
+        "Return elements in reading order (top-to-bottom, left-to-right)."
+    )
+    user_prompt = (
+        f"Analyze this document image ({w}x{h} pixels). "
+        f"Detect all paragraphs, lines within paragraphs, words within lines, "
+        f"and characters within words. Return [x1,y1,x2,y2] bboxes for each. "
+        f"Set is_handwritten=true for handwritten paragraphs, false for printed. "
+        f"For non-character types, set char to empty string. "
+        f"Only include ASCII printable characters (codes 32-126)."
+    )
+
+    result = call_gpt4o_vision(
+        client, page_image, system_prompt, user_prompt,
+        FLAT_ANNOTATION_SCHEMA, detail="high", max_retries=3,
+    )
+    if result is None:
+        log.warning("Flat annotation call failed")
+        return []
+
+    annotations = []
+    for ann in result.get("annotations", []):
+        bbox = ann.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+        bbox = clamp_bbox([int(v) for v in bbox], w, h)
+
+        entry = {
+            "type": ann["type"],
+            "bbox": bbox,
+            "char": ann.get("char", ""),
+            "is_handwritten": force_handwritten or ann.get("is_handwritten", False),
+        }
+
+        # Filter characters to ASCII printable
+        if entry["type"] == "character":
+            ch = entry["char"]
+            if len(ch) != 1 or ch not in CHAR_TO_CLASS:
+                continue
+
+        annotations.append(entry)
+
+    log.info("Flat annotation returned %d elements", len(annotations))
+    return annotations
+
+
+def flat_to_nested_v2(flat_annotations, force_handwritten=False):
+    """Convert flat annotations (4 levels) to nested hierarchy using spatial containment.
+
+    Uses center-point containment to group: chars → words → lines → paragraphs.
+    """
+    paragraphs = []
+    lines = []
+    words = []
+    chars = []
+
+    for ann in flat_annotations:
+        t = ann["type"]
+        if t == "paragraph":
+            paragraphs.append(ann)
+        elif t == "line":
+            lines.append(ann)
+        elif t == "word":
+            words.append(ann)
+        elif t == "character":
+            chars.append(ann)
+
+    # Build nested structure
+    result_paras = []
+    for para in paragraphs:
+        pb = para["bbox"]
+        hw = force_handwritten or para.get("is_handwritten", False)
+
+        # Find lines whose center is inside this paragraph
+        para_lines = []
+        for line in lines:
+            if _contains_center(pb, line["bbox"]):
+                lb = line["bbox"]
+
+                # Find words whose center is inside this line
+                line_words = []
+                for word in words:
+                    if _contains_center(lb, word["bbox"]):
+                        wb = word["bbox"]
+
+                        # Find chars whose center is inside this word
+                        word_chars = []
+                        for ch in chars:
+                            if _contains_center(wb, ch["bbox"]):
+                                word_chars.append({
+                                    "bbox": ch["bbox"],
+                                    "char": ch.get("char", ""),
+                                })
+
+                        # Sort chars left-to-right
+                        word_chars.sort(key=lambda c: c["bbox"][0])
+                        line_words.append({
+                            "bbox": wb,
+                            "characters": word_chars,
+                        })
+
+                # Sort words left-to-right
+                line_words.sort(key=lambda w: w["bbox"][0])
+                para_lines.append({
+                    "bbox": lb,
+                    "words": line_words,
+                })
+
+        # Sort lines top-to-bottom
+        para_lines.sort(key=lambda l: l["bbox"][1])
+        result_paras.append({
+            "bbox": pb,
+            "is_handwritten": hw,
+            "lines": para_lines,
+        })
+
+    # Sort paragraphs top-to-bottom
+    result_paras.sort(key=lambda p: p["bbox"][1])
+    return {"paragraphs": result_paras}
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Flat-to-nested conversion (cascade mode)
 # ---------------------------------------------------------------------------
 
 def _center(bbox):
@@ -487,38 +740,53 @@ def _contains_center(outer, inner_bbox):
 
 
 def flat_to_nested_local(flat_annotations):
-    """Deterministic local fallback: group flat annotations into hierarchy
-    using para_idx/line_idx from the cascade (already implicitly hierarchical).
+    """Deterministic local fallback: group cascade annotations into 4-level hierarchy
+    using para_idx/line_idx/word_idx from the cascade.
     """
     paragraphs_map = {}
     lines_map = {}
+    words_map = {}
     chars_list = []
 
     for ann in flat_annotations:
         if ann["type"] == "paragraph":
             pi = ann["para_idx"]
-            paragraphs_map[pi] = {"bbox": ann["bbox"], "lines": []}
+            paragraphs_map[pi] = {
+                "bbox": ann["bbox"],
+                "is_handwritten": ann.get("is_handwritten", False),
+                "lines": [],
+            }
         elif ann["type"] == "line":
             pi = ann["para_idx"]
             li = ann["line_idx"]
-            lines_map[(pi, li)] = {"bbox": ann["bbox"], "characters": []}
+            lines_map[(pi, li)] = {"bbox": ann["bbox"], "words": []}
+        elif ann["type"] == "word":
+            pi = ann["para_idx"]
+            li = ann["line_idx"]
+            wi = ann["word_idx"]
+            words_map[(pi, li, wi)] = {"bbox": ann["bbox"], "characters": []}
         elif ann["type"] == "character":
             chars_list.append(ann)
 
-    # Assign characters to lines
+    # Assign characters to words
     for ch in chars_list:
-        key = (ch["para_idx"], ch["line_idx"])
-        if key in lines_map:
-            lines_map[key]["characters"].append({
-                "bbox": ch["bbox"], "char": ch["text"],
+        key = (ch["para_idx"], ch["line_idx"], ch["word_idx"])
+        if key in words_map:
+            words_map[key]["characters"].append({
+                "bbox": ch["bbox"], "char": ch.get("text", ch.get("char", "")),
             })
+
+    # Assign words to lines
+    for (pi, li, wi), word_data in sorted(words_map.items()):
+        key = (pi, li)
+        if key in lines_map:
+            lines_map[key]["words"].append(word_data)
 
     # Assign lines to paragraphs
     for (pi, li), line_data in sorted(lines_map.items()):
         if pi in paragraphs_map:
             paragraphs_map[pi]["lines"].append(line_data)
 
-    # Build sorted output
     nested = {
         "paragraphs": [
             paragraphs_map[k] for k in sorted(paragraphs_map.keys())
@@ -623,6 +891,7 @@ def build_annotated_page(page_image, nested, bg_color=None):
     """Add pixel masks to each element in the nested annotation.
 
     Modifies nested in-place, adding "mask" keys with PIL Image values.
+    Handles 4-level hierarchy: paragraphs → lines → words → characters.
     Returns nested dict.
     """
     if bg_color is None:
@@ -634,9 +903,12 @@ def build_annotated_page(page_image, nested, bg_color=None):
         for line in para.get("lines", []):
             bbox = tuple(line["bbox"])
             line["mask"] = _compute_mask(page_image, bbox, bg_color)
-            for char in line.get("characters", []):
-                bbox = tuple(char["bbox"])
-                char["mask"] = _compute_mask(page_image, bbox, bg_color)
+            for word in line.get("words", []):
+                bbox = tuple(word["bbox"])
+                word["mask"] = _compute_mask(page_image, bbox, bg_color)
+                for char in word.get("characters", []):
+                    bbox = tuple(char["bbox"])
+                    char["mask"] = _compute_mask(page_image, bbox, bg_color)
 
     return nested
 
@@ -651,7 +923,8 @@ def save_annotations(output_path, image_path, nested, page_image, bg_color):
         masks/
           para_0_mask.png
           line_0_0_mask.png
-          char_0_0_0_mask.png
+          word_0_0_0_mask.png
+          char_0_0_0_0_mask.png
     """
     os.makedirs(output_path, exist_ok=True)
     masks_dir = os.path.join(output_path, "masks")
@@ -667,6 +940,7 @@ def save_annotations(output_path, image_path, nested, page_image, bg_color):
     for pi, para in enumerate(nested.get("paragraphs", [])):
         para_json = {
             "bbox": para["bbox"],
+            "is_handwritten": para.get("is_handwritten", False),
             "lines": [],
         }
 
@@ -680,7 +954,7 @@ def save_annotations(output_path, image_path, nested, page_image, bg_color):
         for li, line in enumerate(para.get("lines", [])):
             line_json = {
                 "bbox": line["bbox"],
-                "characters": [],
+                "words": [],
             }
 
             # Save line mask
@@ -690,20 +964,35 @@ def save_annotations(output_path, image_path, nested, page_image, bg_color):
                 mask.save(os.path.join(masks_dir, mask_name))
                 line_json["mask_path"] = f"masks/{mask_name}"
 
-            for ci, char in enumerate(line.get("characters", [])):
-                char_json = {
-                    "bbox": char["bbox"],
-                    "char": char["char"],
+            for wi, word in enumerate(line.get("words", [])):
+                word_json = {
+                    "bbox": word["bbox"],
+                    "characters": [],
                 }
 
-                # Save character mask
-                mask = char.get("mask")
+                # Save word mask
+                mask = word.get("mask")
                 if mask is not None:
-                    mask_name = f"char_{pi}_{li}_{ci}_mask.png"
+                    mask_name = f"word_{pi}_{li}_{wi}_mask.png"
                     mask.save(os.path.join(masks_dir, mask_name))
-                    char_json["mask_path"] = f"masks/{mask_name}"
+                    word_json["mask_path"] = f"masks/{mask_name}"
 
-                line_json["characters"].append(char_json)
+                for ci, char in enumerate(word.get("characters", [])):
+                    char_json = {
+                        "bbox": char["bbox"],
+                        "char": char["char"],
+                    }
+
+                    # Save character mask
+                    mask = char.get("mask")
+                    if mask is not None:
+                        mask_name = f"char_{pi}_{li}_{wi}_{ci}_mask.png"
+                        mask.save(os.path.join(masks_dir, mask_name))
+                        char_json["mask_path"] = f"masks/{mask_name}"
+
+                    word_json["characters"].append(char_json)
+
+                line_json["words"].append(word_json)
 
             para_json["lines"].append(line_json)
 
@@ -721,6 +1010,7 @@ def load_annotations(annotation_dir):
 
     Returns (page_image, nested_dict) where nested_dict has the same
     structure as SyntheticPage.paragraphs with PIL mask objects.
+    Supports 4-level hierarchy: paragraphs → lines → words → characters.
     """
     page_path = os.path.join(annotation_dir, "page.png")
     json_path = os.path.join(annotation_dir, "annotations.json")
@@ -737,6 +1027,8 @@ def load_annotations(annotation_dir):
                 os.path.join(annotation_dir, mp)
             ).convert("L")
         para["bbox"] = tuple(para["bbox"])
+        # Ensure is_handwritten exists
+        para.setdefault("is_handwritten", False)
 
         for line in para.get("lines", []):
             mp = line.pop("mask_path", None)
@@ -746,13 +1038,21 @@ def load_annotations(annotation_dir):
                 ).convert("L")
             line["bbox"] = tuple(line["bbox"])
 
-            for char in line.get("characters", []):
-                mp = char.pop("mask_path", None)
+            for word in line.get("words", []):
+                mp = word.pop("mask_path", None)
                 if mp:
-                    char["mask"] = Image.open(
+                    word["mask"] = Image.open(
                         os.path.join(annotation_dir, mp)
                     ).convert("L")
-                char["bbox"] = tuple(char["bbox"])
+                word["bbox"] = tuple(word["bbox"])
+
+                for char in word.get("characters", []):
+                    mp = char.pop("mask_path", None)
+                    if mp:
+                        char["mask"] = Image.open(
+                            os.path.join(annotation_dir, mp)
+                        ).convert("L")
+                    char["bbox"] = tuple(char["bbox"])
 
     return page_image, data
 
@@ -769,18 +1069,25 @@ def visualize_annotations(page_image, nested, output_path):
     colors = {
         "paragraph": (255, 0, 0),    # red
         "line": (0, 0, 255),         # blue
+        "word": (255, 165, 0),       # orange
         "character": (0, 180, 0),    # green
     }
 
     for para in nested.get("paragraphs", []):
         b = para["bbox"]
         draw.rectangle(b, outline=colors["paragraph"], width=3)
+        hw_label = "HW" if para.get("is_handwritten") else "PR"
+        draw.text((b[0], max(0, b[1] - 14)), hw_label,
+                  fill=colors["paragraph"])
         for line in para.get("lines", []):
             b = line["bbox"]
             draw.rectangle(b, outline=colors["line"], width=2)
-            for char in line.get("characters", []):
-                b = char["bbox"]
-                draw.rectangle(b, outline=colors["character"], width=1)
+            for word in line.get("words", []):
+                b = word["bbox"]
+                draw.rectangle(b, outline=colors["word"], width=2)
+                for char in word.get("characters", []):
+                    b = char["bbox"]
+                    draw.rectangle(b, outline=colors["character"], width=1)
 
     vis_path = os.path.join(output_path, "visualization.png")
     vis.save(vis_path)
@@ -808,12 +1115,20 @@ def parse_args():
         help="Background color as R,G,B (e.g. 255,255,255). Auto-detected if omitted.",
     )
     parser.add_argument(
+        "--cascade", action="store_true",
+        help="Use cascade mode (multiple GPT calls) instead of flat mode",
+    )
+    parser.add_argument(
         "--skip-nesting-gpt", action="store_true",
-        help="Use local deterministic nesting instead of GPT",
+        help="Use local deterministic nesting instead of GPT (cascade mode only)",
     )
     parser.add_argument(
         "--rate-limit-delay", type=float, default=0.5,
         help="Delay between API calls in seconds (default: 0.5)",
+    )
+    parser.add_argument(
+        "--handwritten", action="store_true",
+        help="Force is_handwritten=True on all paragraphs",
     )
     parser.add_argument(
         "--visualize", action="store_true",
@@ -847,6 +1162,9 @@ def main():
             log.error("--bg-color must be integers: R,G,B")
             sys.exit(1)
 
+    mode = "cascade" if args.cascade else "flat"
+    log.info("Annotation mode: %s", mode)
+
     for image_path in args.images:
         log.info("Processing: %s", image_path)
 
@@ -858,23 +1176,43 @@ def main():
         img_bg = bg_color if bg_color else estimate_background_color(page_image)
         log.info("Background color: %s", img_bg)
 
-        # Stage 1: hierarchical vision cascade
-        log.info("Stage 1: Hierarchical vision cascade")
-        flat = build_flat_annotations(
-            client, page_image,
-            rate_limit_delay=args.rate_limit_delay,
-        )
+        if mode == "flat":
+            # Flat mode: single GPT call → spatial nesting
+            log.info("Stage 1: Flat annotation (single GPT call)")
+            flat = annotate_flat(
+                client, page_image,
+                force_handwritten=args.handwritten,
+            )
+            if not flat:
+                log.warning("No annotations for %s, skipping", image_path)
+                continue
 
-        if not flat:
-            log.warning("No annotations detected for %s, skipping", image_path)
-            continue
-
-        # Stage 2: flat-to-nested conversion
-        log.info("Stage 2: Flat-to-nested conversion")
-        if args.skip_nesting_gpt:
-            nested = flat_to_nested_local(flat)
+            log.info("Stage 2: Spatial nesting (flat_to_nested_v2)")
+            nested = flat_to_nested_v2(
+                flat, force_handwritten=args.handwritten,
+            )
         else:
-            nested = flat_to_nested(client, flat)
+            # Cascade mode: multi-call pipeline
+            log.info("Stage 1: Cascade annotation (multiple GPT calls)")
+            flat = build_cascade_annotations(
+                client, page_image,
+                rate_limit_delay=args.rate_limit_delay,
+            )
+            if not flat:
+                log.warning("No annotations for %s, skipping", image_path)
+                continue
+
+            # Apply --handwritten flag
+            if args.handwritten:
+                for ann in flat:
+                    if ann["type"] == "paragraph":
+                        ann["is_handwritten"] = True
+
+            log.info("Stage 2: Flat-to-nested conversion")
+            if args.skip_nesting_gpt:
+                nested = flat_to_nested_local(flat)
+            else:
+                nested = flat_to_nested_local(flat)
 
         # Stage 3: mask computation + output
         log.info("Stage 3: Mask computation + output")
@@ -895,14 +1233,20 @@ def main():
             len(p.get("lines", []))
             for p in nested.get("paragraphs", [])
         )
-        n_chars = sum(
-            len(l.get("characters", []))
+        n_words = sum(
+            len(l.get("words", []))
             for p in nested.get("paragraphs", [])
             for l in p.get("lines", [])
         )
+        n_chars = sum(
+            len(w.get("characters", []))
+            for p in nested.get("paragraphs", [])
+            for l in p.get("lines", [])
+            for w in l.get("words", [])
+        )
         log.info(
-            "Done: %s — %d paragraphs, %d lines, %d characters",
-            image_path, n_para, n_lines, n_chars,
+            "Done: %s — %d paragraphs, %d lines, %d words, %d characters",
+            image_path, n_para, n_lines, n_words, n_chars,
         )
 
     log.info("All images processed.")

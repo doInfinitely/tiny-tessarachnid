@@ -22,6 +22,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from generate_training_data import (
     CLASS_NONE,
+    NUM_CLASSES,
     RETINA_SIZE,
     AugmentedSubset,
     CharacterPretrainDataset,
@@ -30,8 +31,6 @@ from generate_training_data import (
     build_augmentation,
     discover_fonts,
 )
-
-NUM_CLASSES = 98
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +63,9 @@ _BACKBONE_CONFIGS = {
 
 
 class RetinaOCRNet(nn.Module):
-    def __init__(self, backbone="resnet18"):
+    def __init__(self, backbone="resnet18", num_classes=NUM_CLASSES):
         super().__init__()
+        self.num_classes = num_classes
 
         factory, weights, feat_dim = _BACKBONE_CONFIGS[backbone]
         resnet = factory(weights=weights)
@@ -109,11 +109,11 @@ class RetinaOCRNet(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Class head: 98-class logits
+        # Class head: num_classes logits
         self.class_head = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, NUM_CLASSES),
+            nn.Linear(64, num_classes),
         )
 
     def forward(self, img, prev_bbox):
@@ -130,9 +130,10 @@ class RetinaOCRNet(nn.Module):
         x = x.view(x.size(0), -1)  # (B, feat_dim)
 
         # Normalize prev_bbox: coords / RETINA_SIZE, class_id / NUM_CLASSES
-        prev_norm = prev_bbox.clone()
+        # Trim to 5 dims (x1,y1,x2,y2,class_id) — dataset may supply extra dims
+        prev_norm = prev_bbox[:, :5].clone()
         prev_norm[:, :4] = prev_norm[:, :4] / RETINA_SIZE
-        prev_norm[:, 4] = prev_norm[:, 4] / NUM_CLASSES
+        prev_norm[:, 4] = prev_norm[:, 4] / self.num_classes
 
         # Concatenate and pass through heads
         x = torch.cat([x, prev_norm], dim=1)  # (B, feat_dim + 5)
@@ -511,9 +512,10 @@ if __name__ == "__main__":
         pages.append(SyntheticPage(fonts, args.page_width, args.page_height))
         if is_main_process():
             total_chars = sum(
-                len(line["characters"])
+                len(word["characters"])
                 for para in pages[-1].paragraphs
                 for line in para["lines"]
+                for word in line["words"]
             )
             print(f"  Page {i}: {len(pages[-1].paragraphs)} paragraphs, {total_chars} chars")
 
