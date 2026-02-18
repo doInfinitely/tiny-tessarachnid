@@ -22,6 +22,7 @@ Class tokens (~534 total, dict-based encoding):
           Latin-1 Supplement, Latin Extended-A, Greek, math, arrows, etc.)
 """
 
+import math
 import os
 import sys
 import random
@@ -286,7 +287,163 @@ def erase_region(image, bbox, mask, bg_color):
 
 
 # ---------------------------------------------------------------------------
-# 5. SyntheticPage
+# 5. Contour extraction (V2)
+# ---------------------------------------------------------------------------
+def _convex_hull(points):
+    """Andrew's monotone chain convex hull. Returns CW-ordered vertices."""
+    pts = sorted(set(map(tuple, points)))
+    if len(pts) <= 1:
+        return pts
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and _cross2d(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and _cross2d(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _cross2d(o, a, b):
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _rdp_simplify(points, epsilon):
+    """Ramer-Douglas-Peucker polyline simplification."""
+    if len(points) <= 2:
+        return list(points)
+    start, end = np.array(points[0], dtype=np.float64), np.array(points[-1], dtype=np.float64)
+    line_vec = end - start
+    line_len = np.linalg.norm(line_vec)
+    if line_len < 1e-12:
+        dists = [np.linalg.norm(np.array(p, dtype=np.float64) - start) for p in points]
+    else:
+        line_unit = line_vec / line_len
+        dists = []
+        for p in points:
+            v = np.array(p, dtype=np.float64) - start
+            dists.append(abs(v[0] * line_unit[1] - v[1] * line_unit[0]))
+    idx = int(np.argmax(dists))
+    max_dist = dists[idx]
+    if max_dist > epsilon:
+        left = _rdp_simplify(points[:idx + 1], epsilon)
+        right = _rdp_simplify(points[idx:], epsilon)
+        return left[:-1] + right
+    else:
+        return [points[0], points[-1]]
+
+
+def _ensure_clockwise(points):
+    """Ensure polygon vertices are in clockwise order."""
+    area = 0.0
+    n = len(points)
+    for i in range(n):
+        j = (i + 1) % n
+        area += points[i][0] * points[j][1]
+        area -= points[j][0] * points[i][1]
+    if area > 0:
+        points = list(reversed(points))
+    return points
+
+
+def contour_from_mask(mask, simplify_epsilon=2.0, min_points=4, max_points=20):
+    """Extract a simplified clockwise contour polygon from a binary mask.
+
+    Args:
+        mask: PIL Image mode 'L' (255=content, 0=bg) or numpy uint8 array.
+        simplify_epsilon: RDP simplification tolerance in pixels.
+        min_points: minimum contour points (pad by interpolation if fewer).
+        max_points: maximum contour points (increase epsilon to reduce).
+
+    Returns:
+        List of (x, y) tuples in clockwise order, or empty list if mask is blank.
+    """
+    if isinstance(mask, Image.Image):
+        arr = np.array(mask)
+    else:
+        arr = mask
+    ys, xs = np.where(arr > 0)
+    if len(xs) < 3:
+        return []
+    pts = list(zip(xs.tolist(), ys.tolist()))
+    hull = _convex_hull(pts)
+    if len(hull) < 3:
+        return []
+    # Close the polygon for RDP, then remove duplicate endpoint
+    closed = hull + [hull[0]]
+    simplified = _rdp_simplify(closed, simplify_epsilon)
+    if simplified[-1] == simplified[0] and len(simplified) > 1:
+        simplified = simplified[:-1]
+    # If too many points, increase epsilon iteratively
+    eps = simplify_epsilon
+    while len(simplified) > max_points and eps < 100:
+        eps *= 1.5
+        simplified = _rdp_simplify(closed, eps)
+        if simplified[-1] == simplified[0] and len(simplified) > 1:
+            simplified = simplified[:-1]
+    # If too few, interpolate midpoints on longest edges
+    while len(simplified) < min_points and len(simplified) >= 2:
+        longest_idx = 0
+        longest_dist = 0
+        for i in range(len(simplified)):
+            j = (i + 1) % len(simplified)
+            d = math.hypot(simplified[j][0] - simplified[i][0],
+                           simplified[j][1] - simplified[i][1])
+            if d > longest_dist:
+                longest_dist = d
+                longest_idx = i
+        i = longest_idx
+        j = (i + 1) % len(simplified)
+        mid = ((simplified[i][0] + simplified[j][0]) // 2,
+               (simplified[i][1] + simplified[j][1]) // 2)
+        simplified.insert(j, mid)
+    simplified = _ensure_clockwise(simplified)
+    return [(int(x), int(y)) for x, y in simplified]
+
+
+def contour_orientations(contour):
+    """Compute unit tangent orientation vectors at each contour point.
+
+    Uses central differences (forward/backward at endpoints).
+    Returns list of (dx, dy) unit vectors, same length as contour.
+    """
+    n = len(contour)
+    if n == 0:
+        return []
+    if n == 1:
+        return [(1.0, 0.0)]
+    orientations = []
+    for i in range(n):
+        if i == 0:
+            dx = contour[1][0] - contour[0][0]
+            dy = contour[1][1] - contour[0][1]
+        elif i == n - 1:
+            dx = contour[n - 1][0] - contour[n - 2][0]
+            dy = contour[n - 1][1] - contour[n - 2][1]
+        else:
+            dx = contour[i + 1][0] - contour[i - 1][0]
+            dy = contour[i + 1][1] - contour[i - 1][1]
+        mag = math.hypot(dx, dy)
+        if mag < 1e-12:
+            orientations.append((1.0, 0.0))
+        else:
+            orientations.append((dx / mag, dy / mag))
+    return orientations
+
+
+def contour_to_retina(contour, scale, ox, oy):
+    """Map contour points from source-image coords to retina coords."""
+    return [(int(x * scale + ox), int(y * scale + oy)) for x, y in contour]
+
+
+PREV_CONTOUR_NONE = (0, 0, 0.0, 0.0, CLASS_NONE)  # (x, y, dx, dy, class_id)
+
+
+# ---------------------------------------------------------------------------
+# 6. SyntheticPage
 # ---------------------------------------------------------------------------
 class SyntheticPage:
     """Generate a synthetic page with hierarchical bounding boxes and masks.
@@ -310,12 +467,14 @@ class SyntheticPage:
                         'char':  str
     """
 
-    def __init__(self, fonts, page_width=2048, page_height=2800):
+    def __init__(self, fonts, page_width=2048, page_height=2800,
+                 rotate_paragraphs=False):
         self.width = page_width
         self.height = page_height
         self.bg_color = _random_color()
         self.image = Image.new("RGB", (page_width, page_height), self.bg_color)
         self.paragraphs = []
+        self.rotate_paragraphs = rotate_paragraphs
         self._generate(fonts)
 
     # -- helpers ----------------------------------------------------------
@@ -331,6 +490,55 @@ class SyntheticPage:
     def _random_line(min_words=2, max_words=10):
         n = random.randint(min_words, max_words)
         return " ".join(SyntheticPage._random_word() for _ in range(n))
+
+    def _rotate_paragraph_region(self, para_bbox, angle, lines_data):
+        """Rotate a paragraph region in-place on the page image."""
+        px1, py1, px2, py2 = para_bbox
+        pw, ph = px2 - px1, py2 - py1
+        if pw <= 0 or ph <= 0:
+            return
+        region = self.image.crop((px1, py1, px2, py2))
+        # Erase original region
+        bg_patch = Image.new("RGB", (pw, ph), self.bg_color)
+        self.image.paste(bg_patch, (px1, py1))
+        # Rotate around center with expand=True
+        rotated = region.rotate(-angle, resample=Image.BICUBIC,
+                                expand=True, fillcolor=self.bg_color)
+        rw, rh = rotated.size
+        # Compute paste position (centered on original center)
+        cx, cy = px1 + pw // 2, py1 + ph // 2
+        paste_x = cx - rw // 2
+        paste_y = cy - rh // 2
+        # Clamp to page bounds
+        paste_x = max(0, min(paste_x, self.width - rw))
+        paste_y = max(0, min(paste_y, self.height - rh))
+        self.image.paste(rotated, (paste_x, paste_y))
+        # Transform all element bboxes
+        rad = math.radians(angle)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        def _rotate_point(x, y):
+            rx = x - pw / 2
+            ry = y - ph / 2
+            nx = rx * cos_a - ry * sin_a + rw / 2 + paste_x
+            ny = rx * sin_a + ry * cos_a + rh / 2 + paste_y
+            return int(nx), int(ny)
+        def _rotate_bbox(bbox):
+            bx1, by1, bx2, by2 = bbox
+            local = [(bx1 - px1, by1 - py1), (bx2 - px1, by1 - py1),
+                     (bx2 - px1, by2 - py1), (bx1 - px1, by2 - py1)]
+            rotated_pts = [_rotate_point(lx, ly) for lx, ly in local]
+            xs = [p[0] for p in rotated_pts]
+            ys = [p[1] for p in rotated_pts]
+            return (min(xs), min(ys), max(xs), max(ys))
+        for ld in lines_data:
+            ld["bbox"] = _rotate_bbox(ld["bbox"])
+            ld["mask"] = _compute_mask(self.image, ld["bbox"], self.bg_color)
+            for wd in ld.get("words", []):
+                wd["bbox"] = _rotate_bbox(wd["bbox"])
+                wd["mask"] = _compute_mask(self.image, wd["bbox"], self.bg_color)
+                for cd in wd.get("characters", []):
+                    cd["bbox"] = _rotate_bbox(cd["bbox"])
+                    cd["mask"] = _compute_mask(self.image, cd["bbox"], self.bg_color)
 
     # -- main generation --------------------------------------------------
     def _generate(self, fonts):
@@ -468,11 +676,37 @@ class SyntheticPage:
             para_x2 = int(max(ld["bbox"][2] for ld in lines_data))
             para_y2 = int(max(ld["bbox"][3] for ld in lines_data))
             para_bbox = (int(para_x1), int(para_y1), para_x2, para_y2)
+
+            if self.rotate_paragraphs:
+                angle = random.uniform(-30, 30)
+                self._rotate_paragraph_region(para_bbox, angle, lines_data)
+                # Recompute para bbox after rotation
+                all_coords = []
+                for ld in lines_data:
+                    b = ld["bbox"]
+                    all_coords.extend([(b[0], b[1]), (b[2], b[3])])
+                if all_coords:
+                    para_x1_new = min(c[0] for c in all_coords)
+                    para_y1_new = min(c[1] for c in all_coords)
+                    para_x2 = max(c[0] for c in all_coords)
+                    para_y2 = max(c[1] for c in all_coords)
+                    para_bbox = (para_x1_new, para_y1_new, para_x2, para_y2)
+
             para_mask = _compute_mask(self.image, para_bbox, self.bg_color)
+
+            # Compute contours for all elements
+            para_contour = contour_from_mask(para_mask)
+            for ld in lines_data:
+                ld["contour"] = contour_from_mask(ld["mask"])
+                for wd in ld.get("words", []):
+                    wd["contour"] = contour_from_mask(wd["mask"])
+                    for cd in wd.get("characters", []):
+                        cd["contour"] = contour_from_mask(cd["mask"])
 
             self.paragraphs.append({
                 "bbox": para_bbox,
                 "mask": para_mask,
+                "contour": para_contour,
                 "is_handwritten": _is_handwriting_font(font_path),
                 "lines": lines_data,
             })
