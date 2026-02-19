@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from generate_training_data import (
     CLASS_NONE,
+    CLASS_PAGE,
     CLASS_PARAGRAPH,
     CLASS_LINE,
     CLASS_WORD,
@@ -111,7 +112,7 @@ class RetinaOCRGPT(nn.Module):
         # --- Detection token embedding ---
         self.det_proj = nn.Linear(6, d_model)  # (x1,y1,x2,y2,class_id,is_handwritten)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        self.level_emb = nn.Embedding(4, d_model)  # 0=para, 1=line, 2=word, 3=char
+        self.level_emb = nn.Embedding(5, d_model)  # 0=page, 1=para, 2=line, 3=word, 4=char
 
         # --- GPT-2 transformer ---
         self.blocks = nn.ModuleList([

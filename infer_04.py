@@ -1,8 +1,9 @@
 """
 Inference script for ContourOCRNet (V2).
 
-Runs autoregressive contour tracing at 4 hierarchy levels:
-  1. Paragraphs on the page
+Runs autoregressive contour tracing at 5 hierarchy levels:
+  0. Page region on the full image
+  1. Paragraphs within the page crop
   2. Lines within each paragraph
   3. Words within each line
   4. Characters within each word
@@ -24,6 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 from generate_training_data import (
     CHAR_CLASS_OFFSET,
     CLASS_NONE,
+    CLASS_PAGE,
     CLASS_PARAGRAPH,
     CLASS_LINE,
     CLASS_WORD,
@@ -138,7 +140,7 @@ def contour_to_bbox(contour):
 # ---------------------------------------------------------------------------
 def run_inference(model, image_path, output_path, device,
                   closure_threshold=15.0):
-    """4-level hierarchical inference with contour tracing."""
+    """5-level hierarchical inference with contour tracing."""
     page_img = Image.open(image_path).convert("RGB")
     from annotate_real import estimate_background_color
     bg_color = estimate_background_color(page_img)
@@ -146,79 +148,97 @@ def run_inference(model, image_path, output_path, device,
 
     model.eval()
 
-    # Level 0: paragraphs
-    paragraphs = generate_contours(
+    # Level 0: page region
+    page_regions = generate_contours(
         model, page_img, bg_color, 0, device,
         closure_threshold=closure_threshold,
     )
-    print(f"Detected {len(paragraphs)} paragraphs")
+    print(f"Detected {len(page_regions)} page region(s)")
 
     all_text = []
+    all_para_contours = []
     all_line_contours = []
     all_word_contours = []
     all_char_contours = []
 
-    for pi, (para_contour, _) in enumerate(paragraphs):
-        para_bbox = contour_to_bbox(para_contour)
-        para_crop = page_img.crop(para_bbox)
+    for ri, (page_contour, _) in enumerate(page_regions):
+        page_bbox = contour_to_bbox(page_contour)
+        page_crop = page_img.crop(page_bbox)
+        pgx, pgy = page_bbox[0], page_bbox[1]
 
-        # Level 1: lines
-        lines = generate_contours(
-            model, para_crop, bg_color, 1, device,
+        # Level 1: paragraphs within page crop
+        paragraphs = generate_contours(
+            model, page_crop, bg_color, 1, device,
             closure_threshold=closure_threshold,
         )
-        print(f"  Paragraph {pi+1}: {len(lines)} lines")
+        print(f"  Page region {ri+1}: {len(paragraphs)} paragraphs")
 
-        for li, (line_contour, _) in enumerate(lines):
-            page_line_contour = [
-                (x + para_bbox[0], y + para_bbox[1]) for x, y in line_contour
-            ]
-            all_line_contours.append(page_line_contour)
+        for pi, (para_contour, _) in enumerate(paragraphs):
+            page_para_contour = [(x + pgx, y + pgy) for x, y in para_contour]
+            all_para_contours.append(page_para_contour)
 
-            line_bbox = contour_to_bbox(line_contour)
-            line_crop = para_crop.crop(line_bbox)
+            para_bbox = contour_to_bbox(para_contour)
+            para_crop = page_crop.crop(para_bbox)
+            pax, pay = para_bbox[0], para_bbox[1]
 
-            # Level 2: words
-            words = generate_contours(
-                model, line_crop, bg_color, 2, device,
+            # Level 2: lines
+            lines = generate_contours(
+                model, para_crop, bg_color, 2, device,
                 closure_threshold=closure_threshold,
             )
+            print(f"    Paragraph {pi+1}: {len(lines)} lines")
 
-            line_text = []
-            for wi, (word_contour, _) in enumerate(words):
-                page_word_contour = [
-                    (x + line_bbox[0] + para_bbox[0],
-                     y + line_bbox[1] + para_bbox[1])
-                    for x, y in word_contour
+            for li, (line_contour, _) in enumerate(lines):
+                page_line_contour = [
+                    (x + pax + pgx, y + pay + pgy) for x, y in line_contour
                 ]
-                all_word_contours.append(page_word_contour)
+                all_line_contours.append(page_line_contour)
 
-                word_bbox = contour_to_bbox(word_contour)
-                word_crop = line_crop.crop(word_bbox)
+                line_bbox = contour_to_bbox(line_contour)
+                line_crop = para_crop.crop(line_bbox)
+                lx, ly = line_bbox[0], line_bbox[1]
 
-                # Level 3: characters
-                chars = generate_contours(
-                    model, word_crop, bg_color, 3, device,
+                # Level 3: words
+                words = generate_contours(
+                    model, line_crop, bg_color, 3, device,
                     closure_threshold=closure_threshold,
                 )
 
-                word_text = []
-                for char_contour, class_id in chars:
-                    page_char_contour = [
-                        (x + word_bbox[0] + line_bbox[0] + para_bbox[0],
-                         y + word_bbox[1] + line_bbox[1] + para_bbox[1])
-                        for x, y in char_contour
+                line_text = []
+                for wi, (word_contour, _) in enumerate(words):
+                    page_word_contour = [
+                        (x + lx + pax + pgx, y + ly + pay + pgy)
+                        for x, y in word_contour
                     ]
-                    all_char_contours.append((page_char_contour, class_id))
+                    all_word_contours.append(page_word_contour)
 
-                    if class_id >= CHAR_CLASS_OFFSET:
-                        word_text.append(class_to_char(class_id))
-                    else:
-                        word_text.append("?")
+                    word_bbox = contour_to_bbox(word_contour)
+                    word_crop = line_crop.crop(word_bbox)
+                    wx, wy = word_bbox[0], word_bbox[1]
 
-                line_text.append("".join(word_text))
+                    # Level 4: characters
+                    chars = generate_contours(
+                        model, word_crop, bg_color, 4, device,
+                        closure_threshold=closure_threshold,
+                    )
 
-            all_text.append((pi, li, " ".join(line_text)))
+                    word_text = []
+                    for char_contour, class_id in chars:
+                        page_char_contour = [
+                            (x + wx + lx + pax + pgx,
+                             y + wy + ly + pay + pgy)
+                            for x, y in char_contour
+                        ]
+                        all_char_contours.append((page_char_contour, class_id))
+
+                        if class_id >= CHAR_CLASS_OFFSET:
+                            word_text.append(class_to_char(class_id))
+                        else:
+                            word_text.append("?")
+
+                    line_text.append("".join(word_text))
+
+                all_text.append((pi, li, " ".join(line_text)))
 
     # Print detected text
     print("\n--- Detected Text ---")
@@ -232,8 +252,8 @@ def run_inference(model, image_path, output_path, device,
         print(f"  Line {li+1}: {text}")
 
     # Visualize
-    _visualize(page_img, paragraphs, all_line_contours, all_word_contours,
-               all_char_contours, output_path)
+    _visualize(page_img, page_regions, all_para_contours, all_line_contours,
+               all_word_contours, all_char_contours, output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -252,13 +272,16 @@ def _draw_contour(draw, contour, color, width=2):
         draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
 
 
-def _visualize(page_img, paragraphs, line_contours, word_contours,
-               char_contours, output_path):
+def _visualize(page_img, page_regions, para_contours, line_contours,
+               word_contours, char_contours, output_path):
     vis = page_img.copy()
     draw = ImageDraw.Draw(vis)
 
-    for para_contour, _ in paragraphs:
-        _draw_contour(draw, para_contour, (255, 0, 0), width=3)
+    for page_contour, _ in page_regions:
+        _draw_contour(draw, page_contour, (128, 0, 255), width=4)
+
+    for pc in para_contours:
+        _draw_contour(draw, pc, (255, 0, 0), width=3)
 
     for lc in line_contours:
         _draw_contour(draw, lc, (0, 0, 255), width=2)

@@ -22,6 +22,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from generate_training_data import (
     CLASS_NONE,
+    CLASS_PAGE,
     NUM_CLASSES,
     RETINA_SIZE,
     AugmentedSubset,

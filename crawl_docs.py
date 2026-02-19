@@ -1005,7 +1005,7 @@ def main():
 def _score_documents(args, db, registry):
     """Score all unscored documents with the OCR model and remove non-documents."""
     import torch
-    from generate_training_data import scale_and_pad, CLASS_NONE, PREV_BBOX_NONE
+    from generate_training_data import scale_and_pad, CLASS_NONE, CLASS_PAGE, PREV_BBOX_NONE
     from scrape import load_model, score_document
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

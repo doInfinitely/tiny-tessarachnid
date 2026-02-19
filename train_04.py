@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from generate_training_data import (
     CLASS_NONE,
+    CLASS_PAGE,
     CLASS_PARAGRAPH,
     CLASS_LINE,
     CLASS_WORD,
@@ -115,7 +116,7 @@ class ContourOCRNet(nn.Module):
         # Start-point conditioning: (x, y) = 2 dims
         self.start_proj = nn.Linear(2, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        self.level_emb = nn.Embedding(4, d_model)  # 0=para, 1=line, 2=word, 3=char
+        self.level_emb = nn.Embedding(5, d_model)  # 0=page, 1=para, 2=line, 3=word, 4=char
 
         # --- GPT-2 transformer ---
         self.blocks = nn.ModuleList([
@@ -237,6 +238,7 @@ class ContourSequenceDataset(Dataset):
 
     def _build_index(self):
         for pi, page in enumerate(self.pages):
+            self.index.append((pi, "page", ()))
             self.index.append((pi, "para", ()))
             for pai, para in enumerate(page.paragraphs):
                 self.index.append((pi, "line", (pai,)))
@@ -252,7 +254,9 @@ class ContourSequenceDataset(Dataset):
         pi, level, parent_ids = self.index[idx]
         page = self.pages[pi]
 
-        if level == "para":
+        if level == "page":
+            return self._make_page_sequence(page)
+        elif level == "para":
             return self._make_para_sequence(page)
         elif level == "line":
             return self._make_line_sequence(page, parent_ids[0])
@@ -309,6 +313,19 @@ class ContourSequenceDataset(Dataset):
 
         return img_t, prev_seq, target_seq, start_pt, level_t, S
 
+    def _make_page_sequence(self, page):
+        retina, scale, ox, oy = scale_and_pad(page.image, page.bg_color)
+        img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
+
+        elements = []
+        contour = getattr(page, "page_contour", [])
+        if contour:
+            steps = self._contour_steps(contour, CLASS_PAGE, scale, ox, oy)
+            if steps:
+                elements.append(steps)
+
+        return self._build_sequence(img_t, elements, level_id=0)
+
     def _make_para_sequence(self, page):
         retina, scale, ox, oy = scale_and_pad(page.image, page.bg_color)
         img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
@@ -321,7 +338,7 @@ class ContourSequenceDataset(Dataset):
                 if steps:
                     elements.append(steps)
 
-        return self._build_sequence(img_t, elements, level_id=0)
+        return self._build_sequence(img_t, elements, level_id=1)
 
     def _make_line_sequence(self, page, para_idx):
         para = page.paragraphs[para_idx]
@@ -341,7 +358,7 @@ class ContourSequenceDataset(Dataset):
             if steps:
                 elements.append(steps)
 
-        return self._build_sequence(img_t, elements, level_id=1)
+        return self._build_sequence(img_t, elements, level_id=2)
 
     def _make_word_sequence(self, page, para_idx, line_idx):
         para = page.paragraphs[para_idx]
@@ -361,7 +378,7 @@ class ContourSequenceDataset(Dataset):
             if steps:
                 elements.append(steps)
 
-        return self._build_sequence(img_t, elements, level_id=2)
+        return self._build_sequence(img_t, elements, level_id=3)
 
     def _make_char_sequence(self, page, para_idx, line_idx, word_idx):
         para = page.paragraphs[para_idx]
@@ -382,7 +399,7 @@ class ContourSequenceDataset(Dataset):
             if steps:
                 elements.append(steps)
 
-        return self._build_sequence(img_t, elements, level_id=3)
+        return self._build_sequence(img_t, elements, level_id=4)
 
 
 def contour_collate_fn(batch):

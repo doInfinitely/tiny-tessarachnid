@@ -13,12 +13,13 @@ for paragraphs/lines, left-to-right for words/characters).
 Pages use random background colors and each paragraph gets a random text color.
 Each paragraph also carries an is_handwritten flag based on the rendering font.
 
-Class tokens (~534 total, dict-based encoding):
+Class tokens (~535 total, dict-based encoding):
   0     = NONE (nothing left to detect)
-  1     = PARAGRAPH
-  2     = LINE
-  3     = WORD
-  4+    = characters via CHAR_TO_CLASS dict (~530 chars: ASCII first, then
+  1     = PAGE
+  2     = PARAGRAPH
+  3     = LINE
+  4     = WORD
+  5+    = characters via CHAR_TO_CLASS dict (~530 chars: ASCII first, then
           Latin-1 Supplement, Latin Extended-A, Greek, math, arrows, etc.)
 """
 
@@ -42,10 +43,11 @@ from create_lists import create_character_list
 # ---------------------------------------------------------------------------
 RETINA_SIZE = 1024
 CLASS_NONE = 0
-CLASS_PARAGRAPH = 1
-CLASS_LINE = 2
-CLASS_WORD = 3
-CHAR_CLASS_OFFSET = 4
+CLASS_PAGE = 1
+CLASS_PARAGRAPH = 2
+CLASS_LINE = 3
+CLASS_WORD = 4
+CHAR_CLASS_OFFSET = 5
 
 PRINTABLE_CHARS = create_character_list()  # ~530 chars, ASCII first
 CHAR_TO_CLASS = {ch: i + CHAR_CLASS_OFFSET for i, ch in enumerate(PRINTABLE_CHARS)}
@@ -97,6 +99,8 @@ def char_to_class(ch):
 def class_to_label(class_id):
     if class_id == CLASS_NONE:
         return "NONE"
+    if class_id == CLASS_PAGE:
+        return "PAGE"
     if class_id == CLASS_PARAGRAPH:
         return "PARA"
     if class_id == CLASS_LINE:
@@ -449,9 +453,12 @@ class SyntheticPage:
     """Generate a synthetic page with hierarchical bounding boxes and masks.
 
     Attributes:
-        image:      PIL Image (RGB)
-        bg_color:   (r, g, b) background color
-        paragraphs: list of paragraph dicts, each with:
+        image:          PIL Image (RGB)
+        bg_color:       (r, g, b) background color
+        page_bbox:      (x1,y1,x2,y2) tight bbox around all content
+        page_mask:      PIL Image 'L' — pixel mask for the page content region
+        page_contour:   list of (x,y) — contour polygon of the page region
+        paragraphs:     list of paragraph dicts, each with:
             'bbox':  (x1,y1,x2,y2)
             'mask':  PIL Image 'L' — pixel mask for the paragraph
             'is_handwritten': bool — True if rendered with a handwriting font
@@ -474,6 +481,9 @@ class SyntheticPage:
         self.bg_color = _random_color()
         self.image = Image.new("RGB", (page_width, page_height), self.bg_color)
         self.paragraphs = []
+        self.page_bbox = (0, 0, 0, 0)
+        self.page_mask = None
+        self.page_contour = []
         self.rotate_paragraphs = rotate_paragraphs
         self._generate(fonts)
 
@@ -713,6 +723,16 @@ class SyntheticPage:
 
             y_cursor += random.randint(20, 60)
 
+        # Compute page-level bounding contour from all paragraph regions
+        if self.paragraphs:
+            all_x1 = min(p["bbox"][0] for p in self.paragraphs)
+            all_y1 = min(p["bbox"][1] for p in self.paragraphs)
+            all_x2 = max(p["bbox"][2] for p in self.paragraphs)
+            all_y2 = max(p["bbox"][3] for p in self.paragraphs)
+            self.page_bbox = (all_x1, all_y1, all_x2, all_y2)
+            self.page_mask = _compute_mask(self.image, self.page_bbox, self.bg_color)
+            self.page_contour = contour_from_mask(self.page_mask)
+
 
 # ---------------------------------------------------------------------------
 # 6. RetinaOCRDataset (teacher-forced)
@@ -737,6 +757,10 @@ class RetinaOCRDataset(Dataset):
 
     def _build_index(self):
         for pi, page in enumerate(self.pages):
+            # Page level: detect the page region (1 item + 1 NONE terminator)
+            for i in range(2):
+                self.index.append((pi, "page", (), i))
+
             n_para = len(page.paragraphs)
             for i in range(n_para + 1):
                 self.index.append((pi, "para", (), i))
@@ -763,7 +787,9 @@ class RetinaOCRDataset(Dataset):
         page_idx, level, parent_ids, item_idx = self.index[idx]
         page = self.pages[page_idx]
 
-        if level == "para":
+        if level == "page":
+            img, prev, target = self._make_page_sample(page, item_idx)
+        elif level == "para":
             img, prev, target = self._make_para_sample(page, item_idx)
         elif level == "line":
             img, prev, target = self._make_line_sample(page, parent_ids[0], item_idx)
@@ -779,6 +805,27 @@ class RetinaOCRDataset(Dataset):
         prev_t = torch.tensor(prev, dtype=torch.float32)
         target_t = torch.tensor(target, dtype=torch.float32)
         return img_t, prev_t, target_t
+
+    # -- page level --------------------------------------------------------
+    def _make_page_sample(self, page, item_idx):
+        retina, scale, ox, oy = scale_and_pad(page.image, page.bg_color)
+
+        if item_idx == 0:
+            prev = PREV_BBOX_NONE
+            if page.page_bbox[2] > page.page_bbox[0]:
+                rb = bbox_to_retina(page.page_bbox, scale, ox, oy)
+                target = (rb[0], rb[1], rb[2], rb[3], CLASS_PAGE, 0)
+            else:
+                target = (0, 0, 0, 0, CLASS_NONE, 0)
+        else:
+            if page.page_bbox[2] > page.page_bbox[0]:
+                rb = bbox_to_retina(page.page_bbox, scale, ox, oy)
+                prev = (rb[0], rb[1], rb[2], rb[3], CLASS_PAGE, 0)
+            else:
+                prev = PREV_BBOX_NONE
+            target = (0, 0, 0, 0, CLASS_NONE, 0)
+
+        return retina, prev, target
 
     # -- paragraph level ---------------------------------------------------
     def _make_para_sample(self, page, item_idx):
@@ -1014,6 +1061,8 @@ def visualize_sample(img_tensor, prev_tensor, target_tensor, path):
 
     if cls == CLASS_NONE:
         color = (128, 128, 128)
+    elif cls == CLASS_PAGE:
+        color = (128, 0, 255)  # purple
     elif cls == CLASS_PARAGRAPH:
         color = (255, 0, 0)
     elif cls == CLASS_LINE:
@@ -1080,7 +1129,9 @@ if __name__ == "__main__":
     for entry in dataset.index:
         _, level, parent_ids, item_idx = entry
         page = pages[entry[0]]
-        if level == "para":
+        if level == "page":
+            cls = CLASS_PAGE if item_idx < 1 else CLASS_NONE
+        elif level == "para":
             cls = CLASS_PARAGRAPH if item_idx < len(page.paragraphs) else CLASS_NONE
         elif level == "line":
             para = page.paragraphs[parent_ids[0]]

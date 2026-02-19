@@ -32,7 +32,7 @@ import torch
 from bs4 import BeautifulSoup
 from PIL import Image
 
-from generate_training_data import CLASS_NONE, CLASS_PARAGRAPH, PREV_BBOX_NONE, RETINA_SIZE, scale_and_pad
+from generate_training_data import CLASS_NONE, CLASS_PAGE, CLASS_PARAGRAPH, PREV_BBOX_NONE, RETINA_SIZE, scale_and_pad
 from infer_02 import detect_level
 from train_02 import RetinaOCRNet, _remap_old_backbone_keys
 

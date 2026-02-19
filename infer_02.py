@@ -23,6 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 from generate_training_data import (
     CHAR_CLASS_OFFSET,
     CLASS_NONE,
+    CLASS_PAGE,
     CLASS_LINE,
     CLASS_TO_CHAR,
     CLASS_WORD,
