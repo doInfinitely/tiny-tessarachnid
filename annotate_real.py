@@ -784,6 +784,108 @@ def load_annotations(annotation_dir):
     return page_image, data
 
 
+def load_all_annotations(base_dir):
+    """Load all annotation subdirectories under base_dir.
+
+    Returns list of (page_image, nested_dict) tuples.
+    """
+    results = []
+    for name in sorted(os.listdir(base_dir)):
+        sub = os.path.join(base_dir, name)
+        json_path = os.path.join(sub, "annotations.json")
+        if os.path.isdir(sub) and os.path.isfile(json_path):
+            try:
+                results.append(load_annotations(sub))
+            except Exception as e:
+                log.warning("Failed to load %s: %s", sub, e)
+    log.info("Loaded %d annotation sets from %s", len(results), base_dir)
+    return results
+
+
+class AnnotatedPage:
+    """Wraps load_annotations() output to match SyntheticPage interface.
+
+    SyntheticPage has:
+        .image, .bg_color, .page_bbox, .page_mask, .page_contour,
+        .paragraphs (each with bbox, mask, contour, is_handwritten,
+                     lines → words → characters with bbox, mask, contour, char)
+
+    AnnotatedPage computes contours from masks and fills in page-level fields
+    so ContourSequenceDataset can use it identically to SyntheticPage.
+    """
+
+    def __init__(self, page_image, nested, bg_color=None):
+        self.image = page_image
+        self.bg_color = bg_color or estimate_background_color(page_image)
+        self.paragraphs = nested.get("paragraphs", [])
+
+        # Compute page-level bbox/mask/contour from paragraph union
+        self._compute_page_fields()
+
+        # Add contours to all elements from their masks
+        self._add_contours()
+
+        # Filter characters to supported set
+        self._filter_characters()
+
+    def _compute_page_fields(self):
+        """Compute page_bbox, page_mask, page_contour from paragraph bboxes."""
+        if not self.paragraphs:
+            w, h = self.image.size
+            self.page_bbox = (0, 0, w, h)
+            self.page_mask = _compute_mask(self.image, self.page_bbox, self.bg_color)
+            self.page_contour = contour_from_mask(self.page_mask)
+            return
+
+        x1 = min(p["bbox"][0] for p in self.paragraphs)
+        y1 = min(p["bbox"][1] for p in self.paragraphs)
+        x2 = max(p["bbox"][2] for p in self.paragraphs)
+        y2 = max(p["bbox"][3] for p in self.paragraphs)
+        self.page_bbox = (x1, y1, x2, y2)
+        self.page_mask = _compute_mask(self.image, self.page_bbox, self.bg_color)
+        self.page_contour = contour_from_mask(self.page_mask)
+
+    def _add_contours(self):
+        """Derive contour polygons from masks for all hierarchy levels."""
+        for para in self.paragraphs:
+            mask = para.get("mask")
+            if mask is not None:
+                para["contour"] = contour_from_mask(mask)
+            else:
+                para["contour"] = []
+
+            for line in para.get("lines", []):
+                mask = line.get("mask")
+                if mask is not None:
+                    line["contour"] = contour_from_mask(mask)
+                else:
+                    line["contour"] = []
+
+                for word in line.get("words", []):
+                    mask = word.get("mask")
+                    if mask is not None:
+                        word["contour"] = contour_from_mask(mask)
+                    else:
+                        word["contour"] = []
+
+                    for char in word.get("characters", []):
+                        mask = char.get("mask")
+                        if mask is not None:
+                            char["contour"] = contour_from_mask(mask)
+                        else:
+                            char["contour"] = []
+
+    def _filter_characters(self):
+        """Remove characters not in CHAR_TO_CLASS."""
+        for para in self.paragraphs:
+            for line in para.get("lines", []):
+                for word in line.get("words", []):
+                    word["characters"] = [
+                        ch for ch in word.get("characters", [])
+                        if ch.get("char", "") in CHAR_TO_CLASS
+                    ]
+
+
 # ---------------------------------------------------------------------------
 # AnnotatedPage — adapter for training integration
 # ---------------------------------------------------------------------------

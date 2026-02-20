@@ -913,12 +913,13 @@ if __name__ == "__main__":
 
     # --- Inference mode ---
     if args.infer:
-        try:
-            ckpt = torch.load(args.save_path, map_location=device, weights_only=True)
-            model.load_state_dict(ckpt)
-            print(f"Loaded model from {args.save_path}")
-        except FileNotFoundError:
-            print(f"Warning: {args.save_path} not found, using initialized weights")
+        if not args.resume:
+            try:
+                ckpt = torch.load(args.save_path, map_location=device, weights_only=True)
+                model.load_state_dict(ckpt)
+                print(f"Loaded model from {args.save_path}")
+            except FileNotFoundError:
+                print(f"Warning: {args.save_path} not found, using initialized weights")
 
         from infer_04 import run_inference
         run_inference(model, args.infer, args.output, device)
@@ -999,8 +1000,8 @@ if __name__ == "__main__":
         collate_fn=contour_collate_fn,
     )
 
-    # Freeze backbone for initial phase
-    if args.freeze_backbone_epochs > 0:
+    # Freeze backbone for initial phase (skip when resuming)
+    if args.freeze_backbone_epochs > 0 and not args.resume:
         print(f"Freezing backbone for {args.freeze_backbone_epochs} epochs")
         for name, param in model.named_parameters():
             if any(name.startswith(p) for p in
@@ -1061,7 +1062,9 @@ if __name__ == "__main__":
         device, args.save_path,
         patience=args.patience,
         grad_clip=args.grad_clip,
-        freeze_backbone_epochs=args.freeze_backbone_epochs,
+        freeze_backbone_epochs=(
+            args.freeze_backbone_epochs if not args.resume else 0
+        ),
         warmup_epochs=args.warmup_epochs,
         on_save=deploy_fn,
     )
