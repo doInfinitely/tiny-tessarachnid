@@ -20,7 +20,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import (
+    ConcatDataset, DataLoader, Dataset, WeightedRandomSampler, random_split,
+)
 
 from generate_training_data import (
     CLASS_NONE,
@@ -42,6 +44,7 @@ from generate_training_data import (
     class_to_label,
 )
 from train_02 import _remap_old_backbone_keys
+from annotate_real import AnnotatedPage, load_all_annotations
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +323,10 @@ class ContourSequenceDataset(Dataset):
         elements = []
         contour = getattr(page, "page_contour", [])
         if contour:
-            steps = self._contour_steps(contour, CLASS_PAGE, scale, ox, oy)
+            # Contour is mask-local; shift to page coords for page-level retina
+            bx1, by1 = page.page_bbox[0], page.page_bbox[1]
+            page_contour = [(x + bx1, y + by1) for x, y in contour]
+            steps = self._contour_steps(page_contour, CLASS_PAGE, scale, ox, oy)
             if steps:
                 elements.append(steps)
 
@@ -334,7 +340,10 @@ class ContourSequenceDataset(Dataset):
         for para in page.paragraphs:
             contour = para.get("contour", [])
             if contour:
-                steps = self._contour_steps(contour, CLASS_PARAGRAPH, scale, ox, oy)
+                # Contour is mask-local; shift to page coords for page-level retina
+                px1, py1 = para["bbox"][0], para["bbox"][1]
+                page_contour = [(x + px1, y + py1) for x, y in contour]
+                steps = self._contour_steps(page_contour, CLASS_PARAGRAPH, scale, ox, oy)
                 if steps:
                     elements.append(steps)
 
@@ -352,9 +361,8 @@ class ContourSequenceDataset(Dataset):
             contour = line.get("contour", [])
             if not contour:
                 continue
-            # Shift contour to local (para-relative) coords
-            local_contour = [(x - px1, y - py1) for x, y in contour]
-            steps = self._contour_steps(local_contour, CLASS_LINE, scale, ox, oy)
+            # Contours from contour_from_mask are already in mask-local coords
+            steps = self._contour_steps(contour, CLASS_LINE, scale, ox, oy)
             if steps:
                 elements.append(steps)
 
@@ -373,8 +381,8 @@ class ContourSequenceDataset(Dataset):
             contour = word.get("contour", [])
             if not contour:
                 continue
-            local_contour = [(x - lx1, y - ly1) for x, y in contour]
-            steps = self._contour_steps(local_contour, CLASS_WORD, scale, ox, oy)
+            # Contours from contour_from_mask are already in mask-local coords
+            steps = self._contour_steps(contour, CLASS_WORD, scale, ox, oy)
             if steps:
                 elements.append(steps)
 
@@ -393,9 +401,9 @@ class ContourSequenceDataset(Dataset):
             contour = ch.get("contour", [])
             if not contour:
                 continue
-            local_contour = [(x - wx1, y - wy1) for x, y in contour]
+            # Contours from contour_from_mask are already in mask-local coords
             class_id = char_to_class(ch["char"])
-            steps = self._contour_steps(local_contour, class_id, scale, ox, oy)
+            steps = self._contour_steps(contour, class_id, scale, ox, oy)
             if steps:
                 elements.append(steps)
 
@@ -497,6 +505,7 @@ class ContourLoss(nn.Module):
 
         For each sample in the batch, checks non-adjacent segment pairs
         for intersection using the signed-area cross-product method.
+        Vectorized: all pair-wise cross products computed in a single pass.
         """
         B, S, _ = point_pred.shape
         total_loss = torch.tensor(0.0, device=point_pred.device)
@@ -508,31 +517,49 @@ class ContourLoss(nn.Module):
             if n < 4:
                 continue
             pts = point_pred[b, valid_idx]  # (n, 2)
-            # Check pairs of non-adjacent segments
-            for i in range(n - 1):
-                for j in range(i + 2, n - 1):
-                    if i == 0 and j == n - 2:
-                        continue  # first and last segments share an endpoint in closed contour
-                    p1, p2 = pts[i], pts[i + 1]
-                    p3, p4 = pts[j], pts[j + 1]
-                    d1 = self._cross(p3, p4, p1)
-                    d2 = self._cross(p3, p4, p2)
-                    d3 = self._cross(p1, p2, p3)
-                    d4 = self._cross(p1, p2, p4)
-                    # Soft intersection: sigmoid of negative product of signed areas
-                    s1 = torch.sigmoid(-d1 * d2 * 0.01)
-                    s2 = torch.sigmoid(-d3 * d4 * 0.01)
-                    total_loss = total_loss + s1 * s2
-                    count += 1
+            n_seg = n - 1
+
+            # Segment endpoints: starts[i]->ends[i]
+            starts = pts[:-1]  # (n_seg, 2)
+            ends = pts[1:]     # (n_seg, 2)
+
+            # All non-adjacent pairs (i, j) where j >= i + 2
+            ii, jj = torch.triu_indices(n_seg, n_seg, offset=2,
+                                        device=pts.device)
+
+            # Exclude first-last pair (closed contour shares endpoint)
+            keep = ~((ii == 0) & (jj == n_seg - 1))
+            ii = ii[keep]
+            jj = jj[keep]
+
+            if len(ii) == 0:
+                continue
+
+            # Gather segment endpoints for all pairs: (K, 2)
+            p1 = starts[ii]
+            p2 = ends[ii]
+            p3 = starts[jj]
+            p4 = ends[jj]
+
+            # Vectorized 2D cross: (b-a) x (c-a)
+            def _cross_batch(a, b, c):
+                return (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) \
+                     - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+
+            d1 = _cross_batch(p3, p4, p1)
+            d2 = _cross_batch(p3, p4, p2)
+            d3 = _cross_batch(p1, p2, p3)
+            d4 = _cross_batch(p1, p2, p4)
+
+            s1 = torch.sigmoid(-d1 * d2 * 0.01)
+            s2 = torch.sigmoid(-d3 * d4 * 0.01)
+
+            total_loss = total_loss + (s1 * s2).sum()
+            count += len(ii)
 
         if count > 0:
             total_loss = total_loss / count
         return total_loss
-
-    @staticmethod
-    def _cross(a, b, c):
-        """2D cross product of vectors (b-a) and (c-a)."""
-        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
 
 # ---------------------------------------------------------------------------
@@ -559,17 +586,130 @@ def load_backbone_from_v02(model, checkpoint_path, device):
 
 
 # ---------------------------------------------------------------------------
+# 5b. load_weights_from_v03
+# ---------------------------------------------------------------------------
+def load_weights_from_v03(model, checkpoint_path, device):
+    """Transfer all structurally compatible weights from model_03.pth (V1.5).
+
+    Exact transfers:
+        - ResNet-18 backbone (stem.*, layer1-4.*)
+        - img_proj (512 -> d_model)
+        - level_emb (4 x d_model)
+        - Transformer blocks 0-3 (all ln, attn, ffn params)
+        - ln_f (final LayerNorm)
+        - class_head (d_model -> 64 -> NUM_CLASSES)
+
+    Partial transfers:
+        - pos_emb: V1.5 is (128, d_model), V2 is (256, d_model) — copy first 128 rows
+        - det_proj: V1.5 is (d_model, 6), V2 is (d_model, 5) — copy first 5 input cols
+
+    Skipped (new in V2 / incompatible):
+        - start_proj, point_head, orientation_head
+        - bbox_head, handwritten_head (V1.5-only heads)
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    ckpt = _remap_old_backbone_keys(ckpt)
+
+    model_state = model.state_dict()
+    transferred = []
+    partial = []
+    skipped = []
+
+    for key, src_tensor in ckpt.items():
+        if key not in model_state:
+            # V1.5-only keys (bbox_head, handwritten_head, etc.)
+            skipped.append((key, "not in V2 model"))
+            continue
+
+        dst_tensor = model_state[key]
+
+        if src_tensor.shape == dst_tensor.shape:
+            # Exact match — copy directly
+            model_state[key] = src_tensor
+            transferred.append(key)
+
+        elif key == "pos_emb.weight":
+            # V1.5: (128, d_model) -> V2: (256, d_model) — copy first 128 rows
+            n_copy = min(src_tensor.shape[0], dst_tensor.shape[0])
+            model_state[key][:n_copy] = src_tensor[:n_copy]
+            partial.append((key, f"copied {n_copy}/{dst_tensor.shape[0]} rows"))
+
+        elif key == "det_proj.weight":
+            # V1.5: (d_model, 6) -> V2: (d_model, 5) — copy first 5 input cols
+            n_copy = min(src_tensor.shape[1], dst_tensor.shape[1])
+            model_state[key][:, :n_copy] = src_tensor[:, :n_copy]
+            partial.append((key, f"copied {n_copy}/{dst_tensor.shape[1]} input cols"))
+
+        elif key == "det_proj.bias":
+            # Bias shape is (d_model,) — same in both, but guard against mismatch
+            if src_tensor.shape == dst_tensor.shape:
+                model_state[key] = src_tensor
+                transferred.append(key)
+            else:
+                skipped.append((key, f"shape {src_tensor.shape} vs {dst_tensor.shape}"))
+
+        elif src_tensor.dim() == dst_tensor.dim() and all(
+            s <= d for s, d in zip(src_tensor.shape, dst_tensor.shape)
+        ):
+            # Source fits inside destination on every dim — copy the overlap
+            slices = tuple(slice(0, s) for s in src_tensor.shape)
+            model_state[key][slices] = src_tensor
+            partial.append((key, f"copied {list(src_tensor.shape)} into {list(dst_tensor.shape)}"))
+
+        elif src_tensor.dim() == dst_tensor.dim() and all(
+            s >= d for s, d in zip(src_tensor.shape, dst_tensor.shape)
+        ):
+            # Source is larger — take the slice that fits
+            slices = tuple(slice(0, d) for d in dst_tensor.shape)
+            model_state[key] = src_tensor[slices]
+            partial.append((key, f"sliced {list(src_tensor.shape)} to {list(dst_tensor.shape)}"))
+
+        else:
+            skipped.append((key, f"shape {src_tensor.shape} vs {dst_tensor.shape}"))
+
+    model.load_state_dict(model_state)
+
+    print(f"=== Weight transfer from {checkpoint_path} ===")
+    print(f"  Exact transfers: {len(transferred)} params")
+    print(f"  Partial transfers: {len(partial)}")
+    for key, note in partial:
+        print(f"    {key}: {note}")
+    print(f"  Skipped: {len(skipped)}")
+    for key, note in skipped:
+        print(f"    {key}: {note}")
+
+    return model
+
+
+# ---------------------------------------------------------------------------
 # 6. Training loop
 # ---------------------------------------------------------------------------
 def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
-        patience=15, grad_clip=1.0, freeze_backbone_epochs=0, scheduler=None):
+        patience=15, grad_clip=1.0, freeze_backbone_epochs=0, scheduler=None,
+        warmup_epochs=0):
     best_val_loss = float("inf")
     epochs_no_improve = 0
 
     if scheduler is None:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="min", factor=0.5, patience=5,
-        )
+        if warmup_epochs > 0 and epochs > warmup_epochs:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                opt, start_factor=0.01, total_iters=warmup_epochs,
+            )
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=epochs - warmup_epochs,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                opt, schedulers=[warmup_sched, cosine_sched],
+                milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode="min", factor=0.5, patience=5,
+            )
+
+    use_cosine = not isinstance(
+        scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau,
+    )
 
     for epoch in range(epochs):
         if epoch == freeze_backbone_epochs and freeze_backbone_epochs > 0:
@@ -648,7 +788,10 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
         v_cls /= v_n
         v_int /= v_n
 
-        scheduler.step(v_total)
+        if use_cosine:
+            scheduler.step()
+        else:
+            scheduler.step(v_total)
         cur_lr = opt.param_groups[0]["lr"]
 
         print(
@@ -711,9 +854,25 @@ if __name__ == "__main__":
 
     # Training phases
     parser.add_argument("--pretrained", type=str, default=None,
-                        help="Path to model_02.pth for backbone init")
+                        help="Path to model_02.pth for backbone-only init")
+    parser.add_argument("--pretrained-v03", type=str, default=None,
+                        help="Path to model_03.pth for full weight transfer")
     parser.add_argument("--freeze-backbone-epochs", type=int, default=5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Linear LR warmup epochs before cosine decay (0=use ReduceLROnPlateau)")
+
+    # Real data
+    parser.add_argument("--real-data", type=str, default=None,
+                        help="Directory of annotated real images (from annotate_real.py)")
+    parser.add_argument("--real-ratio", type=float, default=0.3,
+                        help="Fraction of training samples from real data (default: 0.3)")
+
+    # Resume / fine-tune
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Load full model checkpoint (takes precedence over --pretrained)")
+    parser.add_argument("--finetune-lr-factor", type=float, default=0.1,
+                        help="LR multiplier when resuming with real data (default: 0.1)")
 
     # Inference mode
     parser.add_argument("--infer", type=str, default=None,
@@ -739,7 +898,13 @@ if __name__ == "__main__":
         dropout=args.dropout,
     ).to(device)
 
-    if args.pretrained:
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt)
+        print(f"Resumed full checkpoint from {args.resume}")
+    elif args.pretrained_v03:
+        load_weights_from_v03(model, args.pretrained_v03, device)
+    elif args.pretrained:
         load_backbone_from_v02(model, args.pretrained, device)
 
     # --- Inference mode ---
@@ -763,28 +928,64 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"Generating {args.pages} synthetic pages (rotate={args.rotate})...")
-    pages = []
+    synth_pages = []
     for i in range(args.pages):
-        pages.append(SyntheticPage(fonts, args.page_width, args.page_height,
-                                   rotate_paragraphs=args.rotate))
+        synth_pages.append(SyntheticPage(fonts, args.page_width, args.page_height,
+                                         rotate_paragraphs=args.rotate))
         total_chars = sum(
             len(word["characters"])
-            for para in pages[-1].paragraphs
+            for para in synth_pages[-1].paragraphs
             for line in para["lines"]
             for word in line["words"]
         )
-        print(f"  Page {i}: {len(pages[-1].paragraphs)} paragraphs, {total_chars} chars")
+        print(f"  Page {i}: {len(synth_pages[-1].paragraphs)} paragraphs, {total_chars} chars")
 
-    dataset = ContourSequenceDataset(pages=pages, max_seq_len=args.max_seq_len)
-    print(f"Dataset size: {len(dataset)} sequences")
+    synth_ds = ContourSequenceDataset(pages=synth_pages, max_seq_len=args.max_seq_len)
+    print(f"Synthetic dataset: {len(synth_ds)} sequences")
 
-    val_size = max(1, int(len(dataset) * args.val_split))
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
-    print(f"Train: {train_size}, Val: {val_size}")
+    # Load real annotated pages if provided
+    real_ds = None
+    if args.real_data:
+        print(f"Loading real annotated pages from {args.real_data}...")
+        real_pages = load_all_annotations(args.real_data)
+        print(f"Loaded {len(real_pages)} real pages")
+        if real_pages:
+            real_ds = ContourSequenceDataset(pages=real_pages, max_seq_len=args.max_seq_len)
+            print(f"Real dataset: {len(real_ds)} sequences")
+
+    # Combine datasets
+    if real_ds is not None and len(real_ds) > 0:
+        combined_ds = ConcatDataset([synth_ds, real_ds])
+        n_synth = len(synth_ds)
+        n_real = len(real_ds)
+        n_total = n_synth + n_real
+        print(f"Combined dataset: {n_total} sequences ({n_synth} synth + {n_real} real)")
+
+        # Weighted sampler: real_ratio controls effective mix
+        r = args.real_ratio
+        w_real = r / n_real
+        w_synth = (1.0 - r) / n_synth
+        weights = [w_synth] * n_synth + [w_real] * n_real
+
+        val_size = max(1, int(n_total * args.val_split))
+        train_size = n_total - val_size
+        train_ds, val_ds = random_split(combined_ds, [train_size, val_size])
+
+        # Build per-sample weights for the train subset
+        train_weights = [weights[idx] for idx in train_ds.indices]
+        sampler = WeightedRandomSampler(train_weights, num_samples=len(train_ds),
+                                        replacement=True)
+        print(f"Train: {train_size}, Val: {val_size}  (real_ratio={r:.0%})")
+    else:
+        val_size = max(1, int(len(synth_ds) * args.val_split))
+        train_size = len(synth_ds) - val_size
+        train_ds, val_ds = random_split(synth_ds, [train_size, val_size])
+        sampler = None
+        print(f"Train: {train_size}, Val: {val_size}  (synthetic only)")
 
     train_dl = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size,
+        shuffle=(sampler is None), sampler=sampler,
         num_workers=2, pin_memory=True,
         collate_fn=contour_collate_fn,
     )
@@ -801,6 +1002,12 @@ if __name__ == "__main__":
             if any(name.startswith(p) for p in
                    ("stem.", "layer1.", "layer2.", "layer3.", "layer4.")):
                 param.requires_grad = False
+
+    # LR scaling: lower LR when fine-tuning a resumed model on real data
+    base_lr = args.lr
+    if args.resume and args.real_data:
+        base_lr = args.lr * args.finetune_lr_factor
+        print(f"Fine-tune LR: {args.lr} * {args.finetune_lr_factor} = {base_lr:.2e}")
 
     # Differential learning rates
     backbone_params = []
@@ -820,9 +1027,9 @@ if __name__ == "__main__":
             transformer_params.append(param)
 
     param_groups = [
-        {"params": backbone_params, "lr": args.lr * 0.01},
-        {"params": projection_params, "lr": args.lr * 0.5},
-        {"params": transformer_params, "lr": args.lr},
+        {"params": backbone_params, "lr": base_lr * 0.01},
+        {"params": projection_params, "lr": base_lr * 0.5},
+        {"params": transformer_params, "lr": base_lr},
     ]
     param_groups = [g for g in param_groups if g["params"]]
 
@@ -842,5 +1049,6 @@ if __name__ == "__main__":
         patience=args.patience,
         grad_clip=args.grad_clip,
         freeze_backbone_epochs=args.freeze_backbone_epochs,
+        warmup_epochs=args.warmup_epochs,
     )
     print("Done.")

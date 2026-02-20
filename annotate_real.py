@@ -41,7 +41,7 @@ from PIL import Image, ImageDraw
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from generate_training_data import CHAR_TO_CLASS, _compute_mask
+from generate_training_data import CHAR_TO_CLASS, _compute_mask, contour_from_mask
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,6 +51,57 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Token throughput tracking
+# ---------------------------------------------------------------------------
+class TokenTracker:
+    """Accumulates per-call token counts and wall-clock time."""
+
+    # GPT-4o pricing (per 1M tokens)
+    INPUT_COST_PER_M = 2.50
+    OUTPUT_COST_PER_M = 10.00
+
+    def __init__(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.calls = 0
+        self.start_time = time.time()
+
+    def record(self, usage):
+        """Record usage from an API response."""
+        if usage is None:
+            return
+        self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+        self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+        self.calls += 1
+        elapsed = time.time() - self.start_time
+        total = self.prompt_tokens + self.completion_tokens
+        tok_s = total / elapsed if elapsed > 0 else 0
+        log.info(
+            "  tokens so far: %d prompt + %d completion = %d total  (%.0f tok/s)",
+            self.prompt_tokens, self.completion_tokens, total, tok_s,
+        )
+
+    def summary(self):
+        """Print final summary."""
+        elapsed = time.time() - self.start_time
+        total = self.prompt_tokens + self.completion_tokens
+        tok_s = total / elapsed if elapsed > 0 else 0
+        cost = (
+            self.prompt_tokens / 1e6 * self.INPUT_COST_PER_M
+            + self.completion_tokens / 1e6 * self.OUTPUT_COST_PER_M
+        )
+        log.info("=== Token usage summary ===")
+        log.info("  API calls:        %d", self.calls)
+        log.info("  Prompt tokens:    %d", self.prompt_tokens)
+        log.info("  Completion tokens: %d", self.completion_tokens)
+        log.info("  Total tokens:     %d", total)
+        log.info("  Wall time:        %.1fs", elapsed)
+        log.info("  Throughput:       %.0f tok/s", tok_s)
+        log.info("  Est. cost:        $%.4f", cost)
+
 
 # ---------------------------------------------------------------------------
 # Structured-output JSON schemas (OpenAI strict mode)
@@ -305,10 +356,12 @@ def validate_bbox(bbox, width, height):
 
 
 def call_gpt4o_vision(client, image, system_prompt, user_prompt,
-                       response_schema, max_retries=3, detail="high"):
+                       response_schema, max_retries=3, detail="high",
+                       tracker=None):
     """Call GPT-4o with an image and structured output schema.
 
     Returns parsed JSON dict or None on failure.
+    If tracker is provided, records token usage from each successful call.
     """
     b64 = encode_image_base64(image)
     messages = [
@@ -337,9 +390,11 @@ def call_gpt4o_vision(client, image, system_prompt, user_prompt,
                     "type": "json_schema",
                     "json_schema": response_schema,
                 },
-                max_tokens=4096,
+                max_tokens=16384,
                 temperature=0.0,
             )
+            if tracker is not None:
+                tracker.record(resp.usage)
             content = resp.choices[0].message.content
             return json.loads(content)
         except Exception as e:
@@ -356,7 +411,7 @@ def call_gpt4o_vision(client, image, system_prompt, user_prompt,
 # Stage 1: Hierarchical vision cascade
 # ---------------------------------------------------------------------------
 
-def detect_paragraphs(client, page_image):
+def detect_paragraphs(client, page_image, tracker=None):
     """Detect paragraph bounding boxes on a full page image.
 
     Returns list of dicts: [{"bbox": [x1,y1,x2,y2]}, ...]
@@ -375,7 +430,7 @@ def detect_paragraphs(client, page_image):
 
     result = call_gpt4o_vision(
         client, page_image, system_prompt, user_prompt,
-        PARAGRAPH_SCHEMA, detail="low",
+        PARAGRAPH_SCHEMA, detail="low", tracker=tracker,
     )
     if result is None:
         log.warning("Paragraph detection failed")
@@ -391,7 +446,7 @@ def detect_paragraphs(client, page_image):
     return paragraphs
 
 
-def detect_lines(client, paragraph_crop):
+def detect_lines(client, paragraph_crop, tracker=None):
     """Detect line bounding boxes within a paragraph crop.
 
     Returns list of dicts: [{"bbox": [x1,y1,x2,y2]}, ...]
@@ -408,7 +463,7 @@ def detect_lines(client, paragraph_crop):
 
     result = call_gpt4o_vision(
         client, paragraph_crop, system_prompt, user_prompt,
-        LINE_SCHEMA, detail="high",
+        LINE_SCHEMA, detail="high", tracker=tracker,
     )
     if result is None:
         log.warning("Line detection failed for paragraph crop")
@@ -424,7 +479,7 @@ def detect_lines(client, paragraph_crop):
     return lines
 
 
-def detect_characters(client, line_crop):
+def detect_characters(client, line_crop, tracker=None):
     """Detect character bounding boxes and labels within a line crop.
 
     Returns list of dicts: [{"bbox": [x1,y1,x2,y2], "char": "A"}, ...]
@@ -444,7 +499,7 @@ def detect_characters(client, line_crop):
 
     result = call_gpt4o_vision(
         client, line_crop, system_prompt, user_prompt,
-        CHARACTER_SCHEMA, detail="high",
+        CHARACTER_SCHEMA, detail="high", tracker=tracker,
     )
     if result is None:
         log.warning("Character detection failed for line crop")
@@ -463,7 +518,7 @@ def detect_characters(client, line_crop):
     return chars
 
 
-def detect_words(client, line_crop):
+def detect_words(client, line_crop, tracker=None):
     """Detect word bounding boxes within a line crop.
 
     Returns list of dicts: [{"bbox": [x1,y1,x2,y2]}, ...]
@@ -481,7 +536,7 @@ def detect_words(client, line_crop):
 
     result = call_gpt4o_vision(
         client, line_crop, system_prompt, user_prompt,
-        WORD_SCHEMA, detail="high",
+        WORD_SCHEMA, detail="high", tracker=tracker,
     )
     if result is None:
         log.warning("Word detection failed for line crop")
@@ -497,7 +552,8 @@ def detect_words(client, line_crop):
     return words
 
 
-def build_cascade_annotations(client, page_image, rate_limit_delay=0.5):
+def build_cascade_annotations(client, page_image, rate_limit_delay=0.5,
+                               tracker=None):
     """Orchestrate the hierarchical vision cascade (4-level).
 
     Calls detect_paragraphs → detect_lines → detect_words → detect_characters.
@@ -509,7 +565,7 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5):
     next_id = 0
 
     # Detect paragraphs
-    paragraphs = detect_paragraphs(client, page_image)
+    paragraphs = detect_paragraphs(client, page_image, tracker=tracker)
     time.sleep(rate_limit_delay)
 
     for pi, para in enumerate(paragraphs):
@@ -525,7 +581,7 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5):
         para_crop = page_image.crop(pb)
 
         # Detect lines within paragraph
-        lines = detect_lines(client, para_crop)
+        lines = detect_lines(client, para_crop, tracker=tracker)
         time.sleep(rate_limit_delay)
 
         for li, line in enumerate(lines):
@@ -545,7 +601,7 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5):
             line_crop = para_crop.crop(lb)
 
             # Detect words within line
-            words = detect_words(client, line_crop)
+            words = detect_words(client, line_crop, tracker=tracker)
             time.sleep(rate_limit_delay)
 
             for wi, word in enumerate(words):
@@ -565,7 +621,7 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5):
                 word_crop = line_crop.crop(wb)
 
                 # Detect characters within word
-                chars = detect_characters(client, word_crop)
+                chars = detect_characters(client, word_crop, tracker=tracker)
                 time.sleep(rate_limit_delay)
 
                 for ch in chars:
@@ -592,7 +648,7 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5):
 # Flat annotation mode (default) — single GPT call
 # ---------------------------------------------------------------------------
 
-def annotate_flat(client, page_image, force_handwritten=False):
+def annotate_flat(client, page_image, force_handwritten=False, tracker=None):
     """Single GPT-4o vision call returning all 4 levels in a flat list.
 
     Returns flat list of annotations with type, bbox, char, is_handwritten.
@@ -618,6 +674,7 @@ def annotate_flat(client, page_image, force_handwritten=False):
     result = call_gpt4o_vision(
         client, page_image, system_prompt, user_prompt,
         FLAT_ANNOTATION_SCHEMA, detail="high", max_retries=3,
+        tracker=tracker,
     )
     if result is None:
         log.warning("Flat annotation call failed")
@@ -1058,6 +1115,101 @@ def load_annotations(annotation_dir):
 
 
 # ---------------------------------------------------------------------------
+# AnnotatedPage — adapter for training integration
+# ---------------------------------------------------------------------------
+class AnnotatedPage:
+    """Wraps load_annotations() output to match SyntheticPage interface.
+
+    Provides .image, .bg_color, .paragraphs (with contour at every level),
+    .page_bbox, .page_mask, .page_contour — everything ContourSequenceDataset
+    expects.
+    """
+
+    def __init__(self, annotation_dir):
+        page_image, data = load_annotations(annotation_dir)
+        self.image = page_image
+        self.bg_color = estimate_background_color(page_image)
+
+        self.paragraphs = []
+        for para in data.get("paragraphs", []):
+            p = dict(para)
+            mask = p.get("mask")
+            p["contour"] = contour_from_mask(mask) if mask else []
+            p.setdefault("is_handwritten", False)
+
+            new_lines = []
+            for line in p.get("lines", []):
+                ln = dict(line)
+                mask = ln.get("mask")
+                ln["contour"] = contour_from_mask(mask) if mask else []
+
+                new_words = []
+                for word in ln.get("words", []):
+                    wd = dict(word)
+                    mask = wd.get("mask")
+                    wd["contour"] = contour_from_mask(mask) if mask else []
+
+                    new_chars = []
+                    for ch in wd.get("characters", []):
+                        if ch.get("char", "") not in CHAR_TO_CLASS:
+                            continue
+                        cd = dict(ch)
+                        mask = cd.get("mask")
+                        cd["contour"] = contour_from_mask(mask) if mask else []
+                        new_chars.append(cd)
+                    wd["characters"] = new_chars
+                    new_words.append(wd)
+                ln["words"] = new_words
+                new_lines.append(ln)
+            p["lines"] = new_lines
+            self.paragraphs.append(p)
+
+        # Page-level fields
+        if self.paragraphs:
+            x1 = min(p["bbox"][0] for p in self.paragraphs)
+            y1 = min(p["bbox"][1] for p in self.paragraphs)
+            x2 = max(p["bbox"][2] for p in self.paragraphs)
+            y2 = max(p["bbox"][3] for p in self.paragraphs)
+            self.page_bbox = (x1, y1, x2, y2)
+            self.page_mask = _compute_mask(self.image, self.page_bbox, self.bg_color)
+            self.page_contour = contour_from_mask(self.page_mask)
+        else:
+            w, h = self.image.size
+            self.page_bbox = (0, 0, w, h)
+            self.page_mask = None
+            self.page_contour = []
+
+
+def load_all_annotations(base_dir):
+    """Load all annotated real images from a directory.
+
+    Expects base_dir to contain subdirectories, each produced by
+    annotate_real.py (page.png + annotations.json + masks/).
+
+    Returns list of AnnotatedPage objects, skipping failures with warning.
+    """
+    pages = []
+    for name in sorted(os.listdir(base_dir)):
+        subdir = os.path.join(base_dir, name)
+        json_path = os.path.join(subdir, "annotations.json")
+        if os.path.isdir(subdir) and os.path.isfile(json_path):
+            try:
+                ap = AnnotatedPage(subdir)
+                n_paras = len(ap.paragraphs)
+                n_chars = sum(
+                    len(w["characters"])
+                    for p in ap.paragraphs
+                    for l in p["lines"]
+                    for w in l["words"]
+                )
+                log.info("  Real page '%s': %d paragraphs, %d chars", name, n_paras, n_chars)
+                pages.append(ap)
+            except Exception as e:
+                log.warning("  Failed to load '%s': %s", name, e)
+    return pages
+
+
+# ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
 
@@ -1165,6 +1317,8 @@ def main():
     mode = "cascade" if args.cascade else "flat"
     log.info("Annotation mode: %s", mode)
 
+    tracker = TokenTracker()
+
     for image_path in args.images:
         log.info("Processing: %s", image_path)
 
@@ -1182,6 +1336,7 @@ def main():
             flat = annotate_flat(
                 client, page_image,
                 force_handwritten=args.handwritten,
+                tracker=tracker,
             )
             if not flat:
                 log.warning("No annotations for %s, skipping", image_path)
@@ -1197,6 +1352,7 @@ def main():
             flat = build_cascade_annotations(
                 client, page_image,
                 rate_limit_delay=args.rate_limit_delay,
+                tracker=tracker,
             )
             if not flat:
                 log.warning("No annotations for %s, skipping", image_path)
@@ -1250,6 +1406,7 @@ def main():
         )
 
     log.info("All images processed.")
+    tracker.summary()
 
 
 if __name__ == "__main__":
