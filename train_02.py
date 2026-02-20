@@ -239,7 +239,7 @@ def loss_batch(model, loss_fn, img, prev, target, opt=None,
 
 
 def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
-        patience=15, scaler=None, clip_grad=0.0, warmup_epochs=0):
+        patience=15, scaler=None, clip_grad=0.0, warmup_epochs=0, on_save=None):
     best_val_loss = float("inf")
     epochs_no_improve = 0
     use_ddp = dist.is_initialized()
@@ -328,6 +328,8 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
                 raw_model = model.module if use_ddp else model
                 torch.save(raw_model.state_dict(), save_path)
                 print(f"  -> saved best model ({save_path})")
+                if on_save:
+                    on_save(save_path)
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -381,6 +383,8 @@ if __name__ == "__main__":
     parser.add_argument("--augment", action="store_true", default=True,
                         help="Enable photometric augmentation on train set")
     parser.add_argument("--no-augment", action="store_false", dest="augment")
+    parser.add_argument("--deploy", action="store_true",
+                        help="Deploy weights to glyph-daemon on each checkpoint")
     args = parser.parse_args()
 
     # ---- DDP setup ----
@@ -449,6 +453,15 @@ if __name__ == "__main__":
     # Use more DataLoader workers to keep H100s fed
     num_workers = 4
 
+    # Deploy callback
+    deploy_fn = None
+    if args.deploy and is_main_process():
+        from dotenv import load_dotenv
+        load_dotenv()
+        from deploy_weights import deploy
+        deploy_fn = deploy
+        print("Deploy to glyph-daemon: enabled")
+
     # ---- Phase 1: Character pretraining ----
     if args.pretrain_epochs > 0:
         if is_main_process():
@@ -493,7 +506,8 @@ if __name__ == "__main__":
             char_train_dl, char_val_dl, device, args.save_path,
             patience=args.pretrain_epochs,
             scaler=scaler, clip_grad=args.clip_grad,
-            warmup_epochs=args.warmup_epochs)  # no early stopping during pretrain
+            warmup_epochs=args.warmup_epochs,
+            on_save=deploy_fn)  # no early stopping during pretrain
         if is_main_process():
             print("Character pretraining complete.\n")
 
@@ -560,7 +574,7 @@ if __name__ == "__main__":
     # Train
     fit(args.epochs, model, loss_fn, optimizer, train_dl, val_dl, device, args.save_path,
         patience=args.patience, scaler=scaler, clip_grad=args.clip_grad,
-        warmup_epochs=args.warmup_epochs)
+        warmup_epochs=args.warmup_epochs, on_save=deploy_fn)
 
     cleanup_ddp()
     if is_main_process():

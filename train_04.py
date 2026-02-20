@@ -686,7 +686,7 @@ def load_weights_from_v03(model, checkpoint_path, device):
 # ---------------------------------------------------------------------------
 def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
         patience=15, grad_clip=1.0, freeze_backbone_epochs=0, scheduler=None,
-        warmup_epochs=0):
+        warmup_epochs=0, on_save=None):
     best_val_loss = float("inf")
     epochs_no_improve = 0
 
@@ -807,6 +807,8 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
             epochs_no_improve = 0
             torch.save(model.state_dict(), save_path)
             print(f"  -> saved best model ({save_path})")
+            if on_save:
+                on_save(save_path)
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -878,6 +880,8 @@ if __name__ == "__main__":
     parser.add_argument("--infer", type=str, default=None,
                         help="Run inference on image instead of training")
     parser.add_argument("--output", type=str, default="infer_04_output.png")
+    parser.add_argument("--deploy", action="store_true",
+                        help="Deploy weights to glyph-daemon on each checkpoint")
 
     args = parser.parse_args()
 
@@ -1042,6 +1046,15 @@ if __name__ == "__main__":
         intersect_weight=args.intersect_weight,
     ).to(device)
 
+    # Deploy callback
+    deploy_fn = None
+    if args.deploy:
+        from dotenv import load_dotenv
+        load_dotenv()
+        from deploy_weights import deploy
+        deploy_fn = deploy
+        print("Deploy to glyph-daemon: enabled")
+
     print(f"\n=== Training ContourOCRNet ({args.epochs} epochs) ===")
     fit(
         args.epochs, model, loss_fn, optimizer, train_dl, val_dl,
@@ -1050,5 +1063,6 @@ if __name__ == "__main__":
         grad_clip=args.grad_clip,
         freeze_backbone_epochs=args.freeze_backbone_epochs,
         warmup_epochs=args.warmup_epochs,
+        on_save=deploy_fn,
     )
     print("Done.")

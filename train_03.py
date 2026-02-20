@@ -550,7 +550,8 @@ def load_backbone_from_v02(model, checkpoint_path, device):
 # 6. Training loop
 # ---------------------------------------------------------------------------
 def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
-        patience=15, grad_clip=1.0, freeze_backbone_epochs=0, scheduler=None):
+        patience=15, grad_clip=1.0, freeze_backbone_epochs=0, scheduler=None,
+        on_save=None):
     best_val_loss = float("inf")
     epochs_no_improve = 0
 
@@ -648,6 +649,8 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
             epochs_no_improve = 0
             torch.save(model.state_dict(), save_path)
             print(f"  -> saved best model ({save_path})")
+            if on_save:
+                on_save(save_path)
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -877,6 +880,8 @@ if __name__ == "__main__":
     parser.add_argument("--infer", type=str, default=None,
                         help="Run inference on image instead of training")
     parser.add_argument("--output", type=str, default="infer_03_output.png")
+    parser.add_argument("--deploy", action="store_true",
+                        help="Deploy weights to glyph-daemon on each checkpoint")
 
     args = parser.parse_args()
 
@@ -932,9 +937,10 @@ if __name__ == "__main__":
     for i in range(args.pages):
         pages.append(SyntheticPage(fonts, args.page_width, args.page_height))
         total_chars = sum(
-            len(line["characters"])
+            len(word["characters"])
             for para in pages[-1].paragraphs
             for line in para["lines"]
+            for word in line["words"]
         )
         print(f"  Page {i}: {len(pages[-1].paragraphs)} paragraphs, {total_chars} chars")
 
@@ -1004,6 +1010,15 @@ if __name__ == "__main__":
         hw_weight=args.hw_weight,
     ).to(device)
 
+    # Deploy callback
+    deploy_fn = None
+    if args.deploy:
+        from dotenv import load_dotenv
+        load_dotenv()
+        from deploy_weights import deploy
+        deploy_fn = deploy
+        print("Deploy to glyph-daemon: enabled")
+
     # Train
     print(f"\n=== Training RetinaOCRGPT ({args.epochs} epochs) ===")
     fit(
@@ -1012,5 +1027,6 @@ if __name__ == "__main__":
         patience=args.patience,
         grad_clip=args.grad_clip,
         freeze_backbone_epochs=args.freeze_backbone_epochs,
+        on_save=deploy_fn,
     )
     print("Done.")

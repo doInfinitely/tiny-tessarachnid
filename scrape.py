@@ -58,9 +58,18 @@ def load_model(model_path, device):
     model = RetinaOCRNet().to(device)
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     checkpoint = _remap_old_backbone_keys(checkpoint)
-    missing, _ = model.load_state_dict(checkpoint, strict=False)
+    # Filter out keys with shape mismatches (e.g. class count changed)
+    model_state = model.state_dict()
+    filtered = {
+        k: v for k, v in checkpoint.items()
+        if k in model_state and v.shape == model_state[k].shape
+    }
+    missing, _ = model.load_state_dict(filtered, strict=False)
     model.eval()
-    if missing:
+    skipped = len(checkpoint) - len(filtered)
+    if skipped:
+        print(f"Loaded model from {model_path} ({skipped} keys skipped due to shape mismatch, {len(missing)} new params)")
+    elif missing:
         print(f"Loaded model from {model_path} ({len(missing)} new params initialized randomly)")
     else:
         print(f"Loaded model from {model_path}")

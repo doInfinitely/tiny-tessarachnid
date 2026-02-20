@@ -1,13 +1,9 @@
 """
 Annotate real document images using OpenAI GPT-4o vision API.
 
-Two modes:
-  Flat mode (default) — Single GPT-4o vision call returning all elements:
-      paragraphs, lines, words, characters with bboxes + is_handwritten.
-      Results are spatially nested into 4-level hierarchy.
-
-  Cascade mode (--cascade) — Hierarchical vision cascade (multiple calls):
-      Full page → paragraphs → lines → words → characters.
+Hierarchical vision cascade: crops parent regions and sends each level
+to GPT-4o independently, mirroring the model's retina-based detection:
+    Full page → paragraphs → lines → words → characters.
 
 Output format matches SyntheticPage hierarchy for training integration:
   paragraphs → lines → words → characters, each with bbox, mask, and char label.
@@ -18,9 +14,6 @@ Usage:
       --output-dir real_annotations/ \\
       --bg-color 255,255,255 \\
       --visualize
-
-  # Cascade mode (old multi-call pipeline):
-  .venv/bin/python annotate_real.py image1.png --cascade --skip-nesting-gpt
 
   # Force handwritten label on all paragraphs:
   .venv/bin/python annotate_real.py handwriting.png --handwritten
@@ -185,61 +178,6 @@ CHARACTER_SCHEMA = {
     },
 }
 
-NESTED_SCHEMA = {
-    "name": "nested_annotation",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "paragraphs": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "bbox": {
-                            "type": "array",
-                            "items": {"type": "integer"},
-                        },
-                        "lines": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "bbox": {
-                                        "type": "array",
-                                        "items": {"type": "integer"},
-                                    },
-                                    "characters": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "bbox": {
-                                                    "type": "array",
-                                                    "items": {"type": "integer"},
-                                                },
-                                                "char": {"type": "string"},
-                                            },
-                                            "required": ["bbox", "char"],
-                                            "additionalProperties": False,
-                                        },
-                                    },
-                                },
-                                "required": ["bbox", "characters"],
-                                "additionalProperties": False,
-                            },
-                        },
-                    },
-                    "required": ["bbox", "lines"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["paragraphs"],
-        "additionalProperties": False,
-    },
-}
-
 WORD_SCHEMA = {
     "name": "word_detection",
     "strict": True,
@@ -262,38 +200,6 @@ WORD_SCHEMA = {
             }
         },
         "required": ["words"],
-        "additionalProperties": False,
-    },
-}
-
-FLAT_ANNOTATION_SCHEMA = {
-    "name": "flat_annotation",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "annotations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {
-                            "type": "string",
-                            "enum": ["paragraph", "line", "word", "character"],
-                        },
-                        "bbox": {
-                            "type": "array",
-                            "items": {"type": "integer"},
-                        },
-                        "char": {"type": "string"},
-                        "is_handwritten": {"type": "boolean"},
-                    },
-                    "required": ["type", "bbox", "char", "is_handwritten"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["annotations"],
         "additionalProperties": False,
     },
 }
@@ -408,7 +314,7 @@ def call_gpt4o_vision(client, image, system_prompt, user_prompt,
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Hierarchical vision cascade
+# Hierarchical vision cascade
 # ---------------------------------------------------------------------------
 
 def detect_paragraphs(client, page_image, tracker=None):
@@ -645,156 +551,8 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5,
 
 
 # ---------------------------------------------------------------------------
-# Flat annotation mode (default) — single GPT call
+# Flat-to-nested conversion
 # ---------------------------------------------------------------------------
-
-def annotate_flat(client, page_image, force_handwritten=False, tracker=None):
-    """Single GPT-4o vision call returning all 4 levels in a flat list.
-
-    Returns flat list of annotations with type, bbox, char, is_handwritten.
-    """
-    w, h = page_image.size
-    system_prompt = (
-        "You are a precise document layout and OCR analyzer. Given an image, "
-        "detect ALL elements at four levels: paragraphs, lines, words, and "
-        "characters. Return pixel-coordinate [x1,y1,x2,y2] bounding boxes. "
-        "For each paragraph, indicate if the text is handwritten. "
-        "For characters, provide the ASCII character. "
-        "Return elements in reading order (top-to-bottom, left-to-right)."
-    )
-    user_prompt = (
-        f"Analyze this document image ({w}x{h} pixels). "
-        f"Detect all paragraphs, lines within paragraphs, words within lines, "
-        f"and characters within words. Return [x1,y1,x2,y2] bboxes for each. "
-        f"Set is_handwritten=true for handwritten paragraphs, false for printed. "
-        f"For non-character types, set char to empty string. "
-        f"Only include ASCII printable characters (codes 32-126)."
-    )
-
-    result = call_gpt4o_vision(
-        client, page_image, system_prompt, user_prompt,
-        FLAT_ANNOTATION_SCHEMA, detail="high", max_retries=3,
-        tracker=tracker,
-    )
-    if result is None:
-        log.warning("Flat annotation call failed")
-        return []
-
-    annotations = []
-    for ann in result.get("annotations", []):
-        bbox = ann.get("bbox")
-        if not bbox or len(bbox) != 4:
-            continue
-        bbox = clamp_bbox([int(v) for v in bbox], w, h)
-
-        entry = {
-            "type": ann["type"],
-            "bbox": bbox,
-            "char": ann.get("char", ""),
-            "is_handwritten": force_handwritten or ann.get("is_handwritten", False),
-        }
-
-        # Filter characters to ASCII printable
-        if entry["type"] == "character":
-            ch = entry["char"]
-            if len(ch) != 1 or ch not in CHAR_TO_CLASS:
-                continue
-
-        annotations.append(entry)
-
-    log.info("Flat annotation returned %d elements", len(annotations))
-    return annotations
-
-
-def flat_to_nested_v2(flat_annotations, force_handwritten=False):
-    """Convert flat annotations (4 levels) to nested hierarchy using spatial containment.
-
-    Uses center-point containment to group: chars → words → lines → paragraphs.
-    """
-    paragraphs = []
-    lines = []
-    words = []
-    chars = []
-
-    for ann in flat_annotations:
-        t = ann["type"]
-        if t == "paragraph":
-            paragraphs.append(ann)
-        elif t == "line":
-            lines.append(ann)
-        elif t == "word":
-            words.append(ann)
-        elif t == "character":
-            chars.append(ann)
-
-    # Build nested structure
-    result_paras = []
-    for para in paragraphs:
-        pb = para["bbox"]
-        hw = force_handwritten or para.get("is_handwritten", False)
-
-        # Find lines whose center is inside this paragraph
-        para_lines = []
-        for line in lines:
-            if _contains_center(pb, line["bbox"]):
-                lb = line["bbox"]
-
-                # Find words whose center is inside this line
-                line_words = []
-                for word in words:
-                    if _contains_center(lb, word["bbox"]):
-                        wb = word["bbox"]
-
-                        # Find chars whose center is inside this word
-                        word_chars = []
-                        for ch in chars:
-                            if _contains_center(wb, ch["bbox"]):
-                                word_chars.append({
-                                    "bbox": ch["bbox"],
-                                    "char": ch.get("char", ""),
-                                })
-
-                        # Sort chars left-to-right
-                        word_chars.sort(key=lambda c: c["bbox"][0])
-                        line_words.append({
-                            "bbox": wb,
-                            "characters": word_chars,
-                        })
-
-                # Sort words left-to-right
-                line_words.sort(key=lambda w: w["bbox"][0])
-                para_lines.append({
-                    "bbox": lb,
-                    "words": line_words,
-                })
-
-        # Sort lines top-to-bottom
-        para_lines.sort(key=lambda l: l["bbox"][1])
-        result_paras.append({
-            "bbox": pb,
-            "is_handwritten": hw,
-            "lines": para_lines,
-        })
-
-    # Sort paragraphs top-to-bottom
-    result_paras.sort(key=lambda p: p["bbox"][1])
-    return {"paragraphs": result_paras}
-
-
-# ---------------------------------------------------------------------------
-# Stage 2: Flat-to-nested conversion (cascade mode)
-# ---------------------------------------------------------------------------
-
-def _center(bbox):
-    """Return (cx, cy) center point of a bbox."""
-    return ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
-
-
-def _contains_center(outer, inner_bbox):
-    """Check if the center of inner_bbox is inside outer bbox."""
-    cx, cy = _center(inner_bbox)
-    return outer[0] <= cx <= outer[2] and outer[1] <= cy <= outer[3]
-
 
 def flat_to_nested_local(flat_annotations):
     """Deterministic local fallback: group cascade annotations into 4-level hierarchy
@@ -852,96 +610,8 @@ def flat_to_nested_local(flat_annotations):
     return nested
 
 
-NESTING_SYSTEM_PROMPT = """\
-You are a document structure expert. Given a flat list of detected items \
-(paragraphs, lines, characters) with bounding boxes, you must group them \
-into a nested hierarchy: paragraphs contain lines, lines contain characters.
-
-Use spatial containment: a line belongs to the paragraph whose bbox contains \
-the line's center point; a character belongs to the line whose bbox contains \
-the character's center point.
-
-Example 1:
-Flat input:
-[
-  {"id":0,"type":"paragraph","bbox":[10,10,500,200],"text":""},
-  {"id":1,"type":"line","bbox":[15,15,490,60],"text":""},
-  {"id":2,"type":"character","bbox":[20,20,40,55],"text":"H"},
-  {"id":3,"type":"character","bbox":[42,20,62,55],"text":"i"}
-]
-
-Nested output:
-{"paragraphs":[{"bbox":[10,10,500,200],"lines":[{"bbox":[15,15,490,60],\
-"characters":[{"bbox":[20,20,40,55],"char":"H"},{"bbox":[42,20,62,55],\
-"char":"i"}]}]}]}
-
-Example 2:
-Flat input:
-[
-  {"id":0,"type":"paragraph","bbox":[10,10,400,100],"text":""},
-  {"id":1,"type":"line","bbox":[15,15,390,50],"text":""},
-  {"id":2,"type":"character","bbox":[20,18,35,48],"text":"A"},
-  {"id":3,"type":"paragraph","bbox":[10,120,400,220],"text":""},
-  {"id":4,"type":"line","bbox":[15,125,390,165],"text":""},
-  {"id":5,"type":"character","bbox":[20,128,35,162],"text":"B"}
-]
-
-Nested output:
-{"paragraphs":[{"bbox":[10,10,400,100],"lines":[{"bbox":[15,15,390,50],\
-"characters":[{"bbox":[20,18,35,48],"char":"A"}]}]},\
-{"bbox":[10,120,400,220],"lines":[{"bbox":[15,125,390,165],\
-"characters":[{"bbox":[20,128,35,162],"char":"B"}]}]}]}
-"""
-
-
-def flat_to_nested(client, flat_annotations):
-    """Use GPT-4o text to convert flat annotations to nested hierarchy."""
-    # Simplify the flat list for the prompt
-    simple = []
-    for ann in flat_annotations:
-        simple.append({
-            "id": ann["id"],
-            "type": ann["type"],
-            "bbox": ann["bbox"],
-            "text": ann["text"],
-        })
-
-    user_prompt = (
-        "Convert this flat annotation list to nested hierarchy:\n"
-        + json.dumps(simple, indent=None)
-    )
-
-    messages = [
-        {"role": "system", "content": NESTING_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": NESTED_SCHEMA,
-                },
-                max_tokens=8192,
-                temperature=0.0,
-            )
-            content = resp.choices[0].message.content
-            return json.loads(content)
-        except Exception as e:
-            wait = 2 ** attempt
-            log.warning("Nesting GPT call failed (attempt %d/3): %s — retrying in %ds",
-                        attempt + 1, e, wait)
-            time.sleep(wait)
-
-    log.warning("GPT nesting failed, falling back to local nesting")
-    return flat_to_nested_local(flat_annotations)
-
-
 # ---------------------------------------------------------------------------
-# Stage 3: Mask computation + output
+# Mask computation + output
 # ---------------------------------------------------------------------------
 
 def build_annotated_page(page_image, nested, bg_color=None):
@@ -1252,7 +922,7 @@ def visualize_annotations(page_image, nested, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Annotate real document images using GPT-4o vision",
+        description="Annotate real document images using GPT-4o hierarchical vision cascade",
     )
     parser.add_argument(
         "images", nargs="+",
@@ -1265,14 +935,6 @@ def parse_args():
     parser.add_argument(
         "--bg-color", default=None,
         help="Background color as R,G,B (e.g. 255,255,255). Auto-detected if omitted.",
-    )
-    parser.add_argument(
-        "--cascade", action="store_true",
-        help="Use cascade mode (multiple GPT calls) instead of flat mode",
-    )
-    parser.add_argument(
-        "--skip-nesting-gpt", action="store_true",
-        help="Use local deterministic nesting instead of GPT (cascade mode only)",
     )
     parser.add_argument(
         "--rate-limit-delay", type=float, default=0.5,
@@ -1314,9 +976,6 @@ def main():
             log.error("--bg-color must be integers: R,G,B")
             sys.exit(1)
 
-    mode = "cascade" if args.cascade else "flat"
-    log.info("Annotation mode: %s", mode)
-
     tracker = TokenTracker()
 
     for image_path in args.images:
@@ -1330,45 +989,25 @@ def main():
         img_bg = bg_color if bg_color else estimate_background_color(page_image)
         log.info("Background color: %s", img_bg)
 
-        if mode == "flat":
-            # Flat mode: single GPT call → spatial nesting
-            log.info("Stage 1: Flat annotation (single GPT call)")
-            flat = annotate_flat(
-                client, page_image,
-                force_handwritten=args.handwritten,
-                tracker=tracker,
-            )
-            if not flat:
-                log.warning("No annotations for %s, skipping", image_path)
-                continue
+        # Hierarchical cascade: page → paragraphs → lines → words → characters
+        log.info("Stage 1: Hierarchical cascade annotation")
+        flat = build_cascade_annotations(
+            client, page_image,
+            rate_limit_delay=args.rate_limit_delay,
+            tracker=tracker,
+        )
+        if not flat:
+            log.warning("No annotations for %s, skipping", image_path)
+            continue
 
-            log.info("Stage 2: Spatial nesting (flat_to_nested_v2)")
-            nested = flat_to_nested_v2(
-                flat, force_handwritten=args.handwritten,
-            )
-        else:
-            # Cascade mode: multi-call pipeline
-            log.info("Stage 1: Cascade annotation (multiple GPT calls)")
-            flat = build_cascade_annotations(
-                client, page_image,
-                rate_limit_delay=args.rate_limit_delay,
-                tracker=tracker,
-            )
-            if not flat:
-                log.warning("No annotations for %s, skipping", image_path)
-                continue
+        # Apply --handwritten flag
+        if args.handwritten:
+            for ann in flat:
+                if ann["type"] == "paragraph":
+                    ann["is_handwritten"] = True
 
-            # Apply --handwritten flag
-            if args.handwritten:
-                for ann in flat:
-                    if ann["type"] == "paragraph":
-                        ann["is_handwritten"] = True
-
-            log.info("Stage 2: Flat-to-nested conversion")
-            if args.skip_nesting_gpt:
-                nested = flat_to_nested_local(flat)
-            else:
-                nested = flat_to_nested_local(flat)
+        log.info("Stage 2: Nesting cascade results")
+        nested = flat_to_nested_local(flat)
 
         # Stage 3: mask computation + output
         log.info("Stage 3: Mask computation + output")
