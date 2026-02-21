@@ -43,6 +43,10 @@ from generate_training_data import (
     char_to_class,
     class_to_label,
 )
+from cascade_transforms import (
+    forward_cascade_step,
+    forward_contour,
+)
 from train_02 import _remap_old_backbone_keys
 from annotate_real import AnnotatedPage, load_all_annotations
 
@@ -280,6 +284,16 @@ class ContourSequenceDataset(Dataset):
             steps.append((px, py, dx, dy, class_id))
         return steps
 
+    def _contour_steps_from_retina(self, retina_pts, class_id):
+        """Convert contour points already in retina coords to (x, y, dx, dy, class_id) steps."""
+        if not retina_pts:
+            return []
+        orientations = contour_orientations(retina_pts)
+        steps = []
+        for (px, py), (dx, dy) in zip(retina_pts, orientations):
+            steps.append((px, py, dx, dy, class_id))
+        return steps
+
     def _build_sequence(self, img_t, elements, level_id):
         """Build prev/target sequences from a list of element contour steps.
 
@@ -351,18 +365,33 @@ class ContourSequenceDataset(Dataset):
 
     def _make_line_sequence(self, page, para_idx):
         para = page.paragraphs[para_idx]
-        px1, py1, px2, py2 = para["bbox"]
-        img = page.image.crop((px1, py1, px2, py2))
-        retina, scale, ox, oy = scale_and_pad(img, page.bg_color)
+        # Build paragraph contour in page-global coords
+        para_contour_global = para.get("contour", [])
+        if para_contour_global:
+            px1g, py1g = para["bbox"][0], para["bbox"][1]
+            para_contour_global = [(x + px1g, y + py1g) for x, y in para_contour_global]
+        else:
+            # Fallback: use bbox as a rectangle contour
+            px1, py1, px2, py2 = para["bbox"]
+            para_contour_global = [(px1, py1), (px2, py1), (px2, py2), (px1, py2)]
+
+        # Forward cascade: crop paragraph from page, rotate upright, scale+pad
+        retina, xf = forward_cascade_step(page.image, para_contour_global, page.bg_color)
         img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
 
         elements = []
+        px1, py1 = para["bbox"][0], para["bbox"][1]
         for line in para["lines"]:
             contour = line.get("contour", [])
             if not contour:
                 continue
-            # Contours from contour_from_mask are already in mask-local coords
-            steps = self._contour_steps(contour, CLASS_LINE, scale, ox, oy)
+            # contour is mask-local (relative to line's bbox);
+            # offset to page-global coords
+            lx1, ly1 = line["bbox"][0], line["bbox"][1]
+            global_contour = [(x + lx1, y + ly1) for x, y in contour]
+            # Map through forward transform to retina coords
+            retina_contour = forward_contour(global_contour, xf)
+            steps = self._contour_steps_from_retina(retina_contour, CLASS_LINE)
             if steps:
                 elements.append(steps)
 
@@ -371,9 +400,17 @@ class ContourSequenceDataset(Dataset):
     def _make_word_sequence(self, page, para_idx, line_idx):
         para = page.paragraphs[para_idx]
         line = para["lines"][line_idx]
-        lx1, ly1, lx2, ly2 = line["bbox"]
-        img = page.image.crop((lx1, ly1, lx2, ly2))
-        retina, scale, ox, oy = scale_and_pad(img, page.bg_color)
+        # Build line contour in page-global coords
+        line_contour_global = line.get("contour", [])
+        if line_contour_global:
+            lx1g, ly1g = line["bbox"][0], line["bbox"][1]
+            line_contour_global = [(x + lx1g, y + ly1g) for x, y in line_contour_global]
+        else:
+            lx1, ly1, lx2, ly2 = line["bbox"]
+            line_contour_global = [(lx1, ly1), (lx2, ly1), (lx2, ly2), (lx1, ly2)]
+
+        # Forward cascade: crop line from page, rotate upright, scale+pad
+        retina, xf = forward_cascade_step(page.image, line_contour_global, page.bg_color)
         img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
 
         elements = []
@@ -381,8 +418,13 @@ class ContourSequenceDataset(Dataset):
             contour = word.get("contour", [])
             if not contour:
                 continue
-            # Contours from contour_from_mask are already in mask-local coords
-            steps = self._contour_steps(contour, CLASS_WORD, scale, ox, oy)
+            # contour is mask-local (relative to word's bbox);
+            # offset to page-global coords
+            wx1, wy1 = word["bbox"][0], word["bbox"][1]
+            global_contour = [(x + wx1, y + wy1) for x, y in contour]
+            # Map through forward transform to retina coords
+            retina_contour = forward_contour(global_contour, xf)
+            steps = self._contour_steps_from_retina(retina_contour, CLASS_WORD)
             if steps:
                 elements.append(steps)
 
@@ -391,9 +433,17 @@ class ContourSequenceDataset(Dataset):
     def _make_char_sequence(self, page, para_idx, line_idx, word_idx):
         para = page.paragraphs[para_idx]
         word = para["lines"][line_idx]["words"][word_idx]
-        wx1, wy1, wx2, wy2 = word["bbox"]
-        img = page.image.crop((wx1, wy1, wx2, wy2))
-        retina, scale, ox, oy = scale_and_pad(img, page.bg_color)
+        # Build word contour in page-global coords
+        word_contour_global = word.get("contour", [])
+        if word_contour_global:
+            wx1g, wy1g = word["bbox"][0], word["bbox"][1]
+            word_contour_global = [(x + wx1g, y + wy1g) for x, y in word_contour_global]
+        else:
+            wx1, wy1, wx2, wy2 = word["bbox"]
+            word_contour_global = [(wx1, wy1), (wx2, wy1), (wx2, wy2), (wx1, wy2)]
+
+        # Forward cascade: crop word from page, rotate upright, scale+pad
+        retina, xf = forward_cascade_step(page.image, word_contour_global, page.bg_color)
         img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
 
         elements = []
@@ -401,9 +451,14 @@ class ContourSequenceDataset(Dataset):
             contour = ch.get("contour", [])
             if not contour:
                 continue
-            # Contours from contour_from_mask are already in mask-local coords
+            # contour is mask-local (relative to char's bbox);
+            # offset to page-global coords
+            chx1, chy1 = ch["bbox"][0], ch["bbox"][1]
+            global_contour = [(x + chx1, y + chy1) for x, y in contour]
+            # Map through forward transform to retina coords
             class_id = char_to_class(ch["char"])
-            steps = self._contour_steps(contour, class_id, scale, ox, oy)
+            retina_contour = forward_contour(global_contour, xf)
+            steps = self._contour_steps_from_retina(retina_contour, class_id)
             if steps:
                 elements.append(steps)
 

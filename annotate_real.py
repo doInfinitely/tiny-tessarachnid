@@ -2,12 +2,12 @@
 Annotate real document images using OpenAI GPT-4o vision API.
 
 Hierarchical vision cascade: crops parent regions and sends each level
-to GPT-4o independently, mirroring the model's retina-based detection:
-    Full page → paragraphs → lines → words → characters.
+to GPT-4o independently, mirroring the model's 5-level retina-based detection:
+    Page region → paragraphs → lines → words → characters.
 
-Output format matches SyntheticPage hierarchy for training integration:
-  paragraphs → lines → words → characters, each with bbox, mask, and char label.
-  Paragraphs carry an is_handwritten flag.
+Output format matches the 5-level hierarchy for training integration:
+  page_region → paragraphs → lines → words → characters,
+  each with bbox, mask, and char label. Paragraphs carry an is_handwritten flag.
 
 Usage:
   .venv/bin/python annotate_real.py image1.png [image2.jpg ...] \\
@@ -99,6 +99,29 @@ class TokenTracker:
 # ---------------------------------------------------------------------------
 # Structured-output JSON schemas (OpenAI strict mode)
 # ---------------------------------------------------------------------------
+PAGE_REGION_SCHEMA = {
+    "name": "page_region_detection",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "page_region": {
+                "type": "object",
+                "properties": {
+                    "bbox": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    }
+                },
+                "required": ["bbox"],
+                "additionalProperties": False,
+            }
+        },
+        "required": ["page_region"],
+        "additionalProperties": False,
+    },
+}
+
 PARAGRAPH_SCHEMA = {
     "name": "paragraph_detection",
     "strict": True,
@@ -317,6 +340,46 @@ def call_gpt4o_vision(client, image, system_prompt, user_prompt,
 # Hierarchical vision cascade
 # ---------------------------------------------------------------------------
 
+def detect_page_region(client, page_image, tracker=None):
+    """Detect the text-bearing region on the full page image (Level 0).
+
+    Returns bbox [x1,y1,x2,y2] of the page region, or None if detection fails
+    (caller should fall back to the full image).
+    """
+    w, h = page_image.size
+    system_prompt = (
+        "You are a document layout analyzer. You detect the text-bearing "
+        "region of a document image — the tightest bounding box that contains "
+        "all text content, excluding empty margins. Return precise pixel coordinates."
+    )
+    user_prompt = (
+        f"Detect the text-bearing region of this document image ({w}x{h} pixels). "
+        f"Return a single [x1,y1,x2,y2] bounding box that tightly encloses all "
+        f"text content, excluding blank margins around the edges."
+    )
+
+    result = call_gpt4o_vision(
+        client, page_image, system_prompt, user_prompt,
+        PAGE_REGION_SCHEMA, detail="low", tracker=tracker,
+    )
+    if result is None:
+        log.warning("Page region detection failed")
+        return None
+
+    region = result.get("page_region", {})
+    bbox = region.get("bbox")
+    if bbox and len(bbox) == 4:
+        bbox = clamp_bbox([int(v) for v in bbox], w, h)
+        # Sanity check: region should be at least 10% of the image
+        area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        if area >= w * h * 0.05:
+            log.info("Detected page region: %s", bbox)
+            return bbox
+
+    log.warning("Page region detection returned invalid bbox, using full image")
+    return None
+
+
 def detect_paragraphs(client, page_image, tracker=None):
     """Detect paragraph bounding boxes on a full page image.
 
@@ -460,22 +523,53 @@ def detect_words(client, line_crop, tracker=None):
 
 def build_cascade_annotations(client, page_image, rate_limit_delay=0.5,
                                tracker=None):
-    """Orchestrate the hierarchical vision cascade (4-level).
+    """Orchestrate the hierarchical vision cascade (5-level).
 
-    Calls detect_paragraphs → detect_lines → detect_words → detect_characters.
+    Level 0: detect_page_region (text-bearing region on full page)
+    Level 1: detect_paragraphs (within page region crop)
+    Level 2: detect_lines (within paragraph crop)
+    Level 3: detect_words (within line crop)
+    Level 4: detect_characters (within word crop)
+
     Translates crop-local coords to page-global coords.
-
     Returns flat list with para_idx, line_idx, word_idx tracking.
     """
     flat = []
     next_id = 0
 
-    # Detect paragraphs
-    paragraphs = detect_paragraphs(client, page_image, tracker=tracker)
+    # Level 0: Detect page region
+    page_region = detect_page_region(client, page_image, tracker=tracker)
+    time.sleep(rate_limit_delay)
+
+    if page_region:
+        pr = page_region
+        region_crop = page_image.crop(pr)
+        pr_offset = (pr[0], pr[1])
+    else:
+        # Fall back to full image
+        w, h = page_image.size
+        pr = [0, 0, w, h]
+        region_crop = page_image
+        pr_offset = (0, 0)
+
+    flat.append({
+        "id": next_id, "type": "page",
+        "bbox": pr, "text": "", "is_handwritten": False,
+        "para_idx": None, "line_idx": None, "word_idx": None,
+    })
+    next_id += 1
+
+    # Level 1: Detect paragraphs within page region
+    paragraphs = detect_paragraphs(client, region_crop, tracker=tracker)
     time.sleep(rate_limit_delay)
 
     for pi, para in enumerate(paragraphs):
-        pb = para["bbox"]
+        pb_local = para["bbox"]
+        # Translate to page-global coords
+        pb = [
+            pb_local[0] + pr_offset[0], pb_local[1] + pr_offset[1],
+            pb_local[2] + pr_offset[0], pb_local[3] + pr_offset[1],
+        ]
         flat.append({
             "id": next_id, "type": "paragraph",
             "bbox": pb, "text": "", "is_handwritten": False,
@@ -483,10 +577,10 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5,
         })
         next_id += 1
 
-        # Crop paragraph region
-        para_crop = page_image.crop(pb)
+        # Crop paragraph from page region crop
+        para_crop = region_crop.crop(pb_local)
 
-        # Detect lines within paragraph
+        # Level 2: Detect lines within paragraph
         lines = detect_lines(client, para_crop, tracker=tracker)
         time.sleep(rate_limit_delay)
 
@@ -506,7 +600,7 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5,
             # Crop line region
             line_crop = para_crop.crop(lb)
 
-            # Detect words within line
+            # Level 3: Detect words within line
             words = detect_words(client, line_crop, tracker=tracker)
             time.sleep(rate_limit_delay)
 
@@ -526,7 +620,7 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5,
                 # Crop word region
                 word_crop = line_crop.crop(wb)
 
-                # Detect characters within word
+                # Level 4: Detect characters within word
                 chars = detect_characters(client, word_crop, tracker=tracker)
                 time.sleep(rate_limit_delay)
 
@@ -555,16 +649,21 @@ def build_cascade_annotations(client, page_image, rate_limit_delay=0.5,
 # ---------------------------------------------------------------------------
 
 def flat_to_nested_local(flat_annotations):
-    """Deterministic local fallback: group cascade annotations into 4-level hierarchy
+    """Deterministic local fallback: group cascade annotations into 5-level hierarchy
     using para_idx/line_idx/word_idx from the cascade.
+
+    Returns dict with page_region bbox and paragraphs list.
     """
+    page_region = None
     paragraphs_map = {}
     lines_map = {}
     words_map = {}
     chars_list = []
 
     for ann in flat_annotations:
-        if ann["type"] == "paragraph":
+        if ann["type"] == "page":
+            page_region = ann["bbox"]
+        elif ann["type"] == "paragraph":
             pi = ann["para_idx"]
             paragraphs_map[pi] = {
                 "bbox": ann["bbox"],
@@ -603,6 +702,7 @@ def flat_to_nested_local(flat_annotations):
             paragraphs_map[pi]["lines"].append(line_data)
 
     nested = {
+        "page_region": page_region,
         "paragraphs": [
             paragraphs_map[k] for k in sorted(paragraphs_map.keys())
         ]
@@ -618,11 +718,16 @@ def build_annotated_page(page_image, nested, bg_color=None):
     """Add pixel masks to each element in the nested annotation.
 
     Modifies nested in-place, adding "mask" keys with PIL Image values.
-    Handles 4-level hierarchy: paragraphs → lines → words → characters.
+    Handles 5-level hierarchy: page_region → paragraphs → lines → words → characters.
     Returns nested dict.
     """
     if bg_color is None:
         bg_color = estimate_background_color(page_image)
+
+    # Page region mask (Level 0)
+    pr = nested.get("page_region")
+    if pr:
+        nested["page_mask"] = _compute_mask(page_image, tuple(pr), bg_color)
 
     for para in nested.get("paragraphs", []):
         bbox = tuple(para["bbox"])
@@ -663,6 +768,16 @@ def save_annotations(output_path, image_path, nested, page_image, bg_color):
 
     # Build JSON-serializable structure and save masks
     json_data = {"paragraphs": [], "image_path": os.path.basename(image_path)}
+
+    # Save page region (Level 0)
+    pr = nested.get("page_region")
+    if pr:
+        json_data["page_region"] = pr
+        page_mask = nested.get("page_mask")
+        if page_mask is not None:
+            mask_name = "page_region_mask.png"
+            page_mask.save(os.path.join(masks_dir, mask_name))
+            json_data["page_mask_path"] = f"masks/{mask_name}"
 
     for pi, para in enumerate(nested.get("paragraphs", [])):
         para_json = {
@@ -745,6 +860,16 @@ def load_annotations(annotation_dir):
     page_image = Image.open(page_path).convert("RGB")
     with open(json_path) as f:
         data = json.load(f)
+
+    # Reconstruct page region mask (Level 0)
+    pr = data.get("page_region")
+    if pr:
+        data["page_region"] = [int(v) for v in pr]
+    pm_path = data.pop("page_mask_path", None)
+    if pm_path:
+        data["page_mask"] = Image.open(
+            os.path.join(annotation_dir, pm_path)
+        ).convert("L")
 
     # Reconstruct masks from files
     for para in data.get("paragraphs", []):
@@ -936,8 +1061,17 @@ class AnnotatedPage:
             p["lines"] = new_lines
             self.paragraphs.append(p)
 
-        # Page-level fields
-        if self.paragraphs:
+        # Page-level fields (Level 0)
+        pr = data.get("page_region")
+        page_mask = data.get("page_mask")
+        if pr:
+            self.page_bbox = tuple(pr)
+            self.page_mask = page_mask if page_mask else _compute_mask(
+                self.image, self.page_bbox, self.bg_color
+            )
+            self.page_contour = contour_from_mask(self.page_mask) if self.page_mask else []
+        elif self.paragraphs:
+            # Backwards compat: compute from paragraph bounds
             x1 = min(p["bbox"][0] for p in self.paragraphs)
             y1 = min(p["bbox"][1] for p in self.paragraphs)
             x2 = max(p["bbox"][2] for p in self.paragraphs)
@@ -991,11 +1125,18 @@ def visualize_annotations(page_image, nested, output_path):
     draw = ImageDraw.Draw(vis)
 
     colors = {
+        "page": (128, 0, 128),       # purple
         "paragraph": (255, 0, 0),    # red
         "line": (0, 0, 255),         # blue
         "word": (255, 165, 0),       # orange
         "character": (0, 180, 0),    # green
     }
+
+    # Draw page region (Level 0)
+    pr = nested.get("page_region")
+    if pr:
+        draw.rectangle(pr, outline=colors["page"], width=4)
+        draw.text((pr[0], max(0, pr[1] - 14)), "PAGE", fill=colors["page"])
 
     for para in nested.get("paragraphs", []):
         b = para["bbox"]

@@ -385,6 +385,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-augment", action="store_false", dest="augment")
     parser.add_argument("--deploy", action="store_true",
                         help="Deploy weights to glyph-daemon on each checkpoint")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from a full checkpoint (loads all weights)")
     args = parser.parse_args()
 
     # ---- DDP setup ----
@@ -419,6 +421,13 @@ if __name__ == "__main__":
     # Model — find_unused_parameters needed because bbox_head gets no grad
     # on batches where all samples are CLASS_NONE (bbox loss is a constant).
     model = RetinaOCRNet(backbone=args.backbone).to(device)
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt)
+        if is_main_process():
+            print(f"Resumed full checkpoint from {args.resume}")
+
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 

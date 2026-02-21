@@ -15,14 +15,19 @@
 # Usage:
 #   ./run_pipeline.sh                    # run full pipeline
 #   SKIP_V2=1 ./run_pipeline.sh          # skip V2 if model_02.pth already exists
+#   SKIP_V3=1 ./run_pipeline.sh          # skip V3 if model_03.pth already exists
 #   V2_GATE=3.5 ./run_pipeline.sh        # override gate threshold
+#   WARM_START=1 ./run_pipeline.sh       # V4 carries backbone from prior model_04.pth
 #
 set -euo pipefail
 
 cd "$(dirname "$0")"
+source .env
+export PYTHONUNBUFFERED=1
 
 PYTHON=".venv/bin/python"
 LOGDIR="pipeline_logs"
+GLYPH_DAEMON_DIR="$HOME/Code/glyph-deamon"
 mkdir -p "$LOGDIR"
 
 # ---------- Gate thresholds ----------
@@ -30,12 +35,28 @@ V2_GATE=${V2_GATE:-4.0}
 V3_GATE=${V3_GATE:-4.0}
 V4_GATE=${V4_GATE:-4.5}
 SKIP_V2=${SKIP_V2:-0}
+SKIP_V3=${SKIP_V3:-0}
+WARM_START=${WARM_START:-0}
 
 # ---------- Helpers ----------
 extract_best_val_loss() {
-    # Grab the val loss from the last "saved best model" epoch.
-    # Handles both "val loss=X" (V2/V3) and "val=X" (V4) log formats.
-    grep 'val' "$1" | grep -E 'val[= ]*loss=|val=' | tail -1 | \
+    # Extract the val loss from the epoch line immediately before the last
+    # "saved best model" line. Handles both "val loss=X" (V2/V3) and
+    # "val=X" (V4) log formats. Syncs tee buffer before reading.
+    sync
+    local logfile="$1"
+    # Find the line number of the last "saved best model" line,
+    # then grab the epoch line just before it.
+    local best_line_num
+    best_line_num=$(grep -n 'saved best model' "$logfile" | tail -1 | cut -d: -f1)
+    if [ -z "$best_line_num" ]; then
+        echo ""
+        return
+    fi
+    local epoch_line
+    epoch_line=$(sed -n "$((best_line_num - 1))p" "$logfile")
+    # Extract val loss from the epoch line
+    echo "$epoch_line" | \
         sed -E 's/.*val[= ]*loss=([0-9.]+).*/\1/; t; s/.*val=([0-9.]+).*/\1/'
 }
 
@@ -45,12 +66,38 @@ check_gate() {
     echo "=== Gate check: $stage ==="
     echo "  Best val loss: $best"
     echo "  Threshold:     < $gate"
+    if [ -z "$best" ]; then
+        echo "  ERROR — could not extract val loss from log. Skipping gate."
+        return 1
+    fi
     if awk "BEGIN {exit !($best < $gate)}"; then
         echo "  PASSED — advancing to next stage."
         return 0
     else
         echo "  FAILED — best val loss $best >= $gate. Stopping pipeline."
         return 1
+    fi
+}
+
+restart_glyph_daemon() {
+    echo ""
+    echo "=== Restarting glyph-daemon ==="
+    # Kill existing glyph-daemon
+    pkill -f 'glyph.daemon' 2>/dev/null || true
+    sleep 2
+    # Start fresh — picks up newly deployed weights
+    cd "$GLYPH_DAEMON_DIR"
+    GLYPH_VAULT_KEY="$GLYPH_VAULT_KEY" \
+    GLYPH_DEVICE="cpu" \
+    GLYPH_WEIGHTS_DIR="$GLYPH_DAEMON_DIR/weights" \
+        nohup "$PYTHON" -m glyph_daemon.main > "$GLYPH_DAEMON_DIR/glyph-daemon.log" 2>&1 &
+    GLYPH_PID=$!
+    cd "$(dirname "$0")"
+    sleep 3
+    if kill -0 "$GLYPH_PID" 2>/dev/null; then
+        echo "  glyph-daemon started (PID $GLYPH_PID)"
+    else
+        echo "  WARNING: glyph-daemon failed to start — check $GLYPH_DAEMON_DIR/glyph-daemon.log"
     fi
 }
 
@@ -62,6 +109,7 @@ echo "========================================"
 echo " tiny-tessarachnid training pipeline"
 echo " $(timestamp)"
 echo " Gates: V2<$V2_GATE  V3<$V3_GATE  V4<$V4_GATE"
+echo " Warm start: $WARM_START"
 echo "========================================"
 echo ""
 
@@ -78,6 +126,12 @@ else
     echo ">>> Stage 1: Training V2 (RetinaOCRNet / resnet18) — log: $V2_LOG"
     echo "    $(timestamp) — starting"
 
+    V2_RESUME_ARG=""
+    if [ -f model_02.pth ]; then
+        V2_RESUME_ARG="--resume model_02.pth"
+        echo "    Resuming from existing model_02.pth"
+    fi
+
     torchrun --standalone --nproc_per_node=1 train_02.py \
         --epochs 50 \
         --batch-size 64 \
@@ -92,6 +146,7 @@ else
         --patience 15 \
         --save-path model_02.pth \
         --deploy \
+        $V2_RESUME_ARG \
         2>&1 | tee "$V2_LOG"
 
     V2_BEST=$(extract_best_val_loss "$V2_LOG")
@@ -102,36 +157,60 @@ fi
 # ================================================================
 # Stage 2: V3 — RetinaOCRGPT (backbone from V2)
 # ================================================================
-V3_LOG="$LOGDIR/train_03_$(date +%Y%m%d_%H%M%S).log"
-echo ""
-echo ">>> Stage 2: Training V3 (RetinaOCRGPT) — log: $V3_LOG"
-echo "    Transferring backbone from model_02.pth"
-echo "    $(timestamp) — starting"
+if [ "$SKIP_V3" = "1" ] && [ -f model_03.pth ]; then
+    echo ">>> Stage 2: SKIPPED (SKIP_V3=1, model_03.pth exists)"
+else
+    V3_LOG="$LOGDIR/train_03_$(date +%Y%m%d_%H%M%S).log"
+    echo ""
+    echo ">>> Stage 2: Training V3 (RetinaOCRGPT) — log: $V3_LOG"
+    echo "    Transferring backbone from model_02.pth"
+    echo "    $(timestamp) — starting"
 
-$PYTHON train_03.py \
-    --epochs 50 \
-    --batch-size 4 \
-    --lr 3e-4 \
-    --pages 30 \
-    --pretrained model_02.pth \
-    --freeze-backbone-epochs 5 \
-    --grad-clip 1.0 \
-    --patience 15 \
-    --save-path model_03.pth \
-    --deploy \
-    2>&1 | tee "$V3_LOG"
+    V3_RESUME_ARG=""
+    if [ -f model_03.pth ]; then
+        V3_RESUME_ARG="--resume model_03.pth"
+        echo "    Resuming from existing model_03.pth"
+    fi
 
-V3_BEST=$(extract_best_val_loss "$V3_LOG")
-echo "    $(timestamp) — finished"
-check_gate "V3 (RetinaOCRGPT)" "$V3_BEST" "$V3_GATE"
+    $PYTHON train_03.py \
+        --epochs 50 \
+        --batch-size 4 \
+        --lr 3e-4 \
+        --pages 30 \
+        --pretrained model_02.pth \
+        --freeze-backbone-epochs 5 \
+        --grad-clip 1.0 \
+        --patience 15 \
+        --save-path model_03.pth \
+        --deploy \
+        $V3_RESUME_ARG \
+        2>&1 | tee "$V3_LOG"
+
+    V3_BEST=$(extract_best_val_loss "$V3_LOG")
+    echo "    $(timestamp) — finished"
+    check_gate "V3 (RetinaOCRGPT)" "$V3_BEST" "$V3_GATE"
+fi
 
 # ================================================================
-# Stage 3: V4 — ContourOCRNet (full weights from V3)
+# Stage 3: V4 — ContourOCRNet (full weights from V3, or warm start)
 # ================================================================
 V4_LOG="$LOGDIR/train_04_$(date +%Y%m%d_%H%M%S).log"
 echo ""
 echo ">>> Stage 3: Training V4 (ContourOCRNet) — log: $V4_LOG"
-echo "    Transferring weights from model_03.pth"
+
+# Decide weight source: warm start transfers all compatible weights from prior
+# V4, backbone-only retains just the ResNet-18 backbone, or cold start from V3
+BACKBONE_ONLY=${BACKBONE_ONLY:-0}
+V4_INIT_ARGS="--pretrained-v03 model_03.pth"
+if [ "$WARM_START" = "1" ] && [ -f model_04.pth ]; then
+    V4_INIT_ARGS="--pretrained-v03 model_04.pth"
+    echo "    WARM START: transferring all compatible weights from prior model_04.pth"
+elif [ "$BACKBONE_ONLY" = "1" ] && [ -f model_04.pth ]; then
+    V4_INIT_ARGS="--pretrained model_04.pth"
+    echo "    BACKBONE ONLY: retaining ResNet-18 backbone from model_04.pth"
+else
+    echo "    Transferring weights from model_03.pth"
+fi
 echo "    $(timestamp) — starting"
 
 $PYTHON train_04.py \
@@ -139,11 +218,13 @@ $PYTHON train_04.py \
     --batch-size 4 \
     --lr 3e-4 \
     --pages 30 \
-    --pretrained-v03 model_03.pth \
+    $V4_INIT_ARGS \
     --freeze-backbone-epochs 5 \
     --grad-clip 1.0 \
     --patience 15 \
     --rotate \
+    --real-data real_annotations \
+    --real-ratio 0.3 \
     --save-path model_04.pth \
     --deploy \
     2>&1 | tee "$V4_LOG"
@@ -153,6 +234,11 @@ echo "    $(timestamp) — finished"
 check_gate "V4 (ContourOCRNet)" "$V4_BEST" "$V4_GATE"
 
 # ================================================================
+# Restart glyph-daemon with final weights
+# ================================================================
+restart_glyph_daemon
+
+# ================================================================
 # Summary
 # ================================================================
 echo ""
@@ -160,8 +246,9 @@ echo "========================================"
 echo " Pipeline complete — $(timestamp)"
 echo "========================================"
 echo " V2 (RetinaOCRNet):  best val_loss = ${V2_BEST:-skipped}  (gate < $V2_GATE)"
-echo " V3 (RetinaOCRGPT):  best val_loss = $V3_BEST  (gate < $V3_GATE)"
+echo " V3 (RetinaOCRGPT):  best val_loss = ${V3_BEST:-skipped}  (gate < $V3_GATE)"
 echo " V4 (ContourOCRNet): best val_loss = $V4_BEST  (gate < $V4_GATE)"
 echo ""
 echo " Models: model_02.pth → model_03.pth → model_04.pth"
+echo " glyph-daemon: restarted with latest weights"
 echo "========================================"

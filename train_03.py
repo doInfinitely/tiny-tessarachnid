@@ -882,6 +882,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="infer_03_output.png")
     parser.add_argument("--deploy", action="store_true",
                         help="Deploy weights to glyph-daemon on each checkpoint")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from a full checkpoint (loads all weights)")
 
     args = parser.parse_args()
 
@@ -903,8 +905,12 @@ if __name__ == "__main__":
         dropout=args.dropout,
     ).to(device)
 
-    # Load pretrained backbone
-    if args.pretrained:
+    # Load weights
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt)
+        print(f"Resumed full checkpoint from {args.resume}")
+    elif args.pretrained:
         load_backbone_from_v02(model, args.pretrained, device)
 
     # --- Inference mode ---
