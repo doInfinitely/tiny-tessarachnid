@@ -29,6 +29,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from cascade_transforms import forward_cascade_step, lift_contour
+from infer_04_cached import encode_image, decode_step
 from generate_training_data import (
     CHAR_CLASS_OFFSET,
     CLASS_NONE,
@@ -88,6 +89,9 @@ def _run_autoregressive(model, img_t, level_id, device,
     """
     level_t = torch.tensor([level_id], dtype=torch.long, device=device)
 
+    # Encode image once; reuse cached features for every autoregressive step
+    img_feat = encode_image(model, img_t)
+
     seq = [list(PREV_CONTOUR_NONE)]  # (x, y, dx, dy, class_id)
     start_point = torch.zeros(1, 2, device=device)
 
@@ -97,8 +101,8 @@ def _run_autoregressive(model, img_t, level_id, device,
 
     for step in range(max_points):
         prev_t = torch.tensor([seq], dtype=torch.float32, device=device)
-        point_pred, orient_pred, class_pred = model(
-            img_t, prev_t, start_point, level_t,
+        point_pred, orient_pred, class_pred = decode_step(
+            model, img_feat, prev_t, start_point, level_t,
         )
 
         # Take last position
