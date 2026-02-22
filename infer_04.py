@@ -1,22 +1,24 @@
 """
-Inference script for ContourOCRNet (V2).
+Inference script for ContourOCRNet (V4).
 
 Runs autoregressive contour tracing at 5 hierarchy levels:
-  0. Page region on the full image  (scale_and_pad)
-  1. Paragraphs on the full image   (scale_and_pad)
-  2. Lines within each paragraph    (forward_cascade_step — rotation-normalized)
-  3. Words within each line         (forward_cascade_step — rotation-normalized)
-  4. Characters within each word    (forward_cascade_step — rotation-normalized)
+  0. Page region on the full image
+  1. Paragraphs on the page
+  2. Lines within each paragraph
+  3. Words within each line
+  4. Characters within each word
 
-Levels 0-1 match training: the model sees scale_and_pad(page_image).
-Levels 2-4 match training: the model sees forward_cascade_step(page_image,
-parent_contour) which crops, rotates to upright, tight-crops, and
-scale_and_pads.  Detected contours are lifted back to page coordinates
-via lift_contour (the inverse of forward_cascade_step).
+At each level the model predicts contour points, orientation vectors, and
+class tokens.  The cascade works entirely in retina space:
 
-At each step the model predicts the next contour point, orientation vector,
-and class token. Contour closure is detected when the predicted point falls
-within a threshold distance of the start point (and >= 3 points emitted).
+  detect contour → rotate so orientation points up → axis-aligned bbox →
+  crop from retina → scale_and_pad onto fresh retina → recurse
+
+Each cascade level is described by:
+  (scale, ox, oy, crop_x, crop_y, angle, rot_cx, rot_cy)
+
+To map coordinates back to the original image, reverse each level one at a
+time from deepest to shallowest.
 """
 
 import argparse
@@ -28,7 +30,6 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from cascade_transforms import forward_cascade_step, lift_contour
 from infer_04_cached import encode_image, decode_step
 from generate_training_data import (
     CHAR_CLASS_OFFSET,
@@ -48,9 +49,49 @@ from train_04 import ContourOCRNet
 from train_02 import _remap_old_backbone_keys
 
 
-def retina_to_source_point(rx, ry, scale, ox, oy):
-    """Map a retina-space point back to source-image coordinates."""
-    return (int((rx - ox) / scale), int((ry - oy) / scale))
+# ---------------------------------------------------------------------------
+# Cascade coordinate tracking
+# ---------------------------------------------------------------------------
+def rotate_point(x, y, angle_deg, cx, cy):
+    """Rotate (x, y) by angle_deg around (cx, cy).
+
+    Positive angle = counterclockwise on screen (PIL convention, y-down).
+    """
+    rad = math.radians(angle_deg)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+    dx, dy = x - cx, y - cy
+    return (cos_a * dx + sin_a * dy + cx,
+            -sin_a * dx + cos_a * dy + cy)
+
+
+def orientation_angle(dx, dy):
+    """Angle (degrees) to rotate so orientation vector (dx, dy) points up."""
+    return math.degrees(math.atan2(dx, -dy))
+
+
+def reverse_level(rx, ry, scale, ox, oy, crop_x, crop_y,
+                  angle=0.0, rot_cx=0.0, rot_cy=0.0):
+    """Reverse one cascade level: child retina coords → parent retina coords.
+
+    Args:
+        rx, ry:            point in this level's retina space
+        scale, ox, oy:     from this level's scale_and_pad
+        crop_x, crop_y:    top-left of crop in parent's (rotated) retina space
+        angle:             rotation applied to parent retina (degrees, CCW)
+        rot_cx, rot_cy:    center of rotation in parent retina space
+
+    Returns:
+        (x, y) in the parent level's retina space (float).
+    """
+    # 1. Undo scale_and_pad + crop offset → position in rotated parent retina
+    x = (rx - ox) / scale + crop_x
+    y = (ry - oy) / scale + crop_y
+    # 2. Undo rotation
+    if angle != 0.0:
+        x, y = rotate_point(x, y, -angle, rot_cx, rot_cy)
+    return (x, y)
+
 
 
 def class_to_char(class_id):
@@ -70,23 +111,18 @@ def _img_to_tensor(pil_img, device):
 
 
 @torch.no_grad()
-def _run_autoregressive(model, img_t, level_id, device,
-                        max_points=256, closure_threshold=15.0):
-    """Core autoregressive contour tracing loop.
-
-    The model emits contour points one at a time. When a point is within
-    `closure_threshold` pixels (retina space) of the start point and at least
-    3 points have been emitted, the contour is closed and we move to the next
-    element. When the model predicts CLASS_NONE, no more elements remain.
+def generate_contours(model, retina, level_id, device,
+                      max_points=256, closure_threshold=15.0):
+    """Autoregressively trace contours on a prepared retina.
 
     Args:
-        img_t: Pre-prepared retina image tensor [1, 3, H, W] on device.
-        level_id: Hierarchy level (0-4).
+        retina: 1024x1024 PIL image (already scale_and_padded).
 
     Returns:
-        list of (retina_contour, class_id) where retina_contour is a list of
-        (x, y) floats in retina coordinates.
+        detections: list of (retina_contour, class_id, orientation) with
+        retina_contour as (rx, ry) floats and orientation as (dx, dy).
     """
+    img_t = _img_to_tensor(retina, device)
     level_t = torch.tensor([level_id], dtype=torch.long, device=device)
 
     # Encode image once; reuse cached features for every autoregressive step
@@ -98,6 +134,7 @@ def _run_autoregressive(model, img_t, level_id, device,
     detections = []
     current_contour_retina = []
     current_class = None
+    current_orient = None
 
     for step in range(max_points):
         prev_t = torch.tensor([seq], dtype=torch.float32, device=device)
@@ -105,101 +142,37 @@ def _run_autoregressive(model, img_t, level_id, device,
             model, img_feat, prev_t, start_point, level_t,
         )
 
-        # Take last position
         class_id = class_pred[0, -1].argmax().item()
         if class_id == CLASS_NONE:
-            # Flush any in-progress contour
             if current_contour_retina and current_class is not None:
-                detections.append((list(current_contour_retina), current_class))
+                detections.append((list(current_contour_retina), current_class,
+                                   current_orient))
             break
 
         px, py = point_pred[0, -1].tolist()
         dx, dy = orient_pred[0, -1].tolist()
 
         if current_class is None:
-            # Starting a new contour
             current_class = class_id
             current_contour_retina = [(px, py)]
+            current_orient = (dx, dy)
             start_point = torch.tensor([[px, py]], device=device)
         else:
             current_contour_retina.append((px, py))
 
-            # Check closure
             if len(current_contour_retina) >= 3:
                 sx, sy = current_contour_retina[0]
                 dist = math.hypot(px - sx, py - sy)
                 if dist < closure_threshold:
-                    detections.append((list(current_contour_retina), current_class))
+                    detections.append((list(current_contour_retina), current_class,
+                                       current_orient))
                     current_contour_retina = []
                     current_class = None
+                    current_orient = None
 
         seq.append([px, py, dx, dy, class_id])
 
     return detections
-
-
-def generate_contours(model, source_img, bg_color, level_id, device,
-                      max_points=256, closure_threshold=15.0):
-    """Generate contours using simple scale_and_pad (for levels 0 and 1).
-
-    Matches training: _make_page_sequence and _make_para_sequence both use
-    scale_and_pad(page.image) with no rotation normalization.
-
-    Returns:
-        list of (source_contour, class_id) where source_contour is a list of
-        (x, y) tuples in source-image coordinates.
-    """
-    retina, scale, ox, oy = scale_and_pad(source_img, bg_color)
-    img_t = _img_to_tensor(retina, device)
-
-    retina_dets = _run_autoregressive(
-        model, img_t, level_id, device, max_points, closure_threshold)
-
-    detections = []
-    for retina_contour, class_id in retina_dets:
-        src_contour = [
-            retina_to_source_point(px, py, scale, ox, oy)
-            for px, py in retina_contour
-        ]
-        detections.append((src_contour, class_id))
-    return detections
-
-
-def generate_contours_cascade(model, page_img, parent_contour, bg_color,
-                              level_id, device, max_points=256,
-                              closure_threshold=15.0):
-    """Generate contours using forward_cascade_step (for levels 2-4).
-
-    Matches training: _make_line_sequence, _make_word_sequence, and
-    _make_char_sequence all use forward_cascade_step(page.image,
-    parent_contour_global, bg_color) which crops the parent contour region,
-    rotates to upright, tight-crops the rotated bbox, and scale_and_pads.
-
-    Detected contours are lifted back to page_img coordinates via
-    lift_contour (inverse of forward_cascade_step).
-
-    Returns:
-        list of (page_contour, class_id) where page_contour is a list of
-        (x, y) tuples in page_img coordinates.
-    """
-    retina_pil, xf = forward_cascade_step(page_img, parent_contour, bg_color)
-    img_t = _img_to_tensor(retina_pil, device)
-
-    retina_dets = _run_autoregressive(
-        model, img_t, level_id, device, max_points, closure_threshold)
-
-    detections = []
-    for retina_contour, class_id in retina_dets:
-        page_contour_pts = lift_contour(retina_contour, xf)
-        detections.append((page_contour_pts, class_id))
-    return detections
-
-
-def contour_to_bbox(contour):
-    """Compute axis-aligned bounding box from a contour polygon."""
-    xs = [p[0] for p in contour]
-    ys = [p[1] for p in contour]
-    return (min(xs), min(ys), max(xs), max(ys))
 
 
 # ---------------------------------------------------------------------------
@@ -207,78 +180,133 @@ def contour_to_bbox(contour):
 # ---------------------------------------------------------------------------
 def run_inference(model, image_path, output_path, device,
                   closure_threshold=15.0):
-    """5-level hierarchical inference with contour tracing.
-
-    Matches the training coordinate pipeline exactly:
-      - Levels 0/1: scale_and_pad(page_image) — same as _make_page_sequence
-        and _make_para_sequence in train_04.py.
-      - Levels 2-4: forward_cascade_step(page_image, parent_contour) — same
-        as _make_line/word/char_sequence.  Detected contours are lifted back
-        to page coordinates via lift_contour.
-    """
+    """5-level hierarchical inference with contour tracing."""
     page_img = Image.open(image_path).convert("RGB")
     from annotate_real import estimate_background_color
     bg_color = estimate_background_color(page_img)
-    print(f"Image: {image_path} ({page_img.size[0]}x{page_img.size[1]}), bg={bg_color}")
+    pw, ph = page_img.size
+    print(f"Image: {image_path} ({pw}x{ph}), bg={bg_color}")
 
     model.eval()
 
-    # Level 0: page regions on full image (scale_and_pad)
-    page_regions = generate_contours(
-        model, page_img, bg_color, 0, device,
-        closure_threshold=closure_threshold,
-    )
-    print(f"Detected {len(page_regions)} page region(s)")
+    def _cascade_step(retina_img, contour, orient, bg):
+        """Full cascade forward step: rotate → bbox → crop → scale_and_pad.
 
-    # Level 1: paragraphs on full image (scale_and_pad — matches training)
-    paragraphs = generate_contours(
-        model, page_img, bg_color, 1, device,
+        Returns (new_retina, level) where level is the tuple needed for
+        reverse_level: (scale, ox, oy, crop_x, crop_y, angle, rot_cx, rot_cy).
+        """
+        # Centroid of contour
+        cx = sum(x for x, y in contour) / len(contour)
+        cy = sum(y for x, y in contour) / len(contour)
+        # Rotation angle to make orientation point up
+        angle = orientation_angle(*orient)
+        # Rotate contour points around centroid
+        rotated = [rotate_point(x, y, angle, cx, cy) for x, y in contour]
+        # Axis-aligned bbox of rotated contour
+        xs = [x for x, y in rotated]
+        ys = [y for x, y in rotated]
+        bx1, by1 = int(min(xs)), int(min(ys))
+        bx2, by2 = int(max(xs)) + 1, int(max(ys)) + 1
+        # Rotate image around centroid and crop
+        rotated_img = retina_img.rotate(angle, center=(cx, cy),
+                                        expand=False, fillcolor=bg,
+                                        resample=Image.BILINEAR)
+        crop_img = rotated_img.crop((bx1, by1, bx2, by2))
+        # Scale and pad onto fresh retina
+        new_retina, scale, ox, oy = scale_and_pad(crop_img, bg)
+        return new_retina, (scale, ox, oy, bx1, by1, angle, cx, cy)
+
+    def _reverse_contour(retina_contour, *levels):
+        """Reverse a retina contour through cascade levels.
+
+        Each level is (scale, ox, oy, crop_x, crop_y, angle, rot_cx, rot_cy).
+        Applied in order (deepest level first, top level last).
+        """
+        result = []
+        for rx, ry in retina_contour:
+            x, y = float(rx), float(ry)
+            for level in levels:
+                x, y = reverse_level(x, y, *level)
+            result.append((int(round(x)), int(round(y))))
+        return result
+
+    # Level 0: scale_and_pad page onto retina, detect page regions
+    retina0, s0, ox0, oy0 = scale_and_pad(page_img, bg_color)
+    L0 = (s0, ox0, oy0, 0, 0)
+
+    page_dets = generate_contours(
+        model, retina0, 0, device,
         closure_threshold=closure_threshold,
     )
-    print(f"Detected {len(paragraphs)} paragraph(s)")
+    print(f"Detected {len(page_dets)} page region(s)")
+
+    # Level 1: detect paragraphs (same retina as page level)
+    para_dets = generate_contours(
+        model, retina0, 1, device,
+        closure_threshold=closure_threshold,
+    )
+    print(f"Detected {len(para_dets)} paragraph(s)")
 
     all_text = []
+    all_page_contours = []
     all_para_contours = []
     all_line_contours = []
     all_word_contours = []
     all_char_contours = []
 
-    for pi, (para_contour, _) in enumerate(paragraphs):
-        # para_contour is already in page_img coordinates
-        all_para_contours.append(para_contour)
+    for page_retina, page_cls, _ in page_dets:
+        all_page_contours.append(
+            (_reverse_contour(page_retina, L0), page_cls)
+        )
 
-        # Level 2: lines within paragraph (forward_cascade_step from page)
-        lines = generate_contours_cascade(
-            model, page_img, para_contour, bg_color, 2, device,
+    for pi, (para_retina, para_cls, para_orient) in enumerate(para_dets):
+        all_para_contours.append(
+            (_reverse_contour(para_retina, L0), para_cls)
+        )
+
+        # Cascade step: rotate → bbox → crop → scale_and_pad
+        retina1, L1 = _cascade_step(retina0, para_retina, para_orient, bg_color)
+
+        # Level 2: detect lines within paragraph
+        line_dets = generate_contours(
+            model, retina1, 2, device,
             closure_threshold=closure_threshold,
         )
-        print(f"  Paragraph {pi+1}: {len(lines)} lines")
+        print(f"  Paragraph {pi+1}: {len(line_dets)} lines")
 
-        for li, (line_contour, _) in enumerate(lines):
-            # line_contour is already in page_img coords (via lift_contour)
-            all_line_contours.append(line_contour)
+        for li, (line_retina, line_cls, line_orient) in enumerate(line_dets):
+            all_line_contours.append(
+                _reverse_contour(line_retina, L1, L0)
+            )
 
-            # Level 3: words within line (forward_cascade_step from page)
-            words = generate_contours_cascade(
-                model, page_img, line_contour, bg_color, 3, device,
+            retina2, L2 = _cascade_step(retina1, line_retina, line_orient, bg_color)
+
+            # Level 3: detect words within line
+            word_dets = generate_contours(
+                model, retina2, 3, device,
                 closure_threshold=closure_threshold,
             )
 
             line_text = []
-            for wi, (word_contour, _) in enumerate(words):
-                # word_contour is already in page_img coords
-                all_word_contours.append(word_contour)
+            for wi, (word_retina, word_cls, word_orient) in enumerate(word_dets):
+                all_word_contours.append(
+                    _reverse_contour(word_retina, L2, L1, L0)
+                )
 
-                # Level 4: characters within word (forward_cascade_step from page)
-                chars = generate_contours_cascade(
-                    model, page_img, word_contour, bg_color, 4, device,
+                retina3, L3 = _cascade_step(retina2, word_retina, word_orient, bg_color)
+
+                # Level 4: detect characters within word
+                char_dets = generate_contours(
+                    model, retina3, 4, device,
                     closure_threshold=closure_threshold,
                 )
 
                 word_text = []
-                for char_contour, class_id in chars:
-                    # char_contour is already in page_img coords
-                    all_char_contours.append((char_contour, class_id))
+                for char_retina, class_id, _ in char_dets:
+                    all_char_contours.append((
+                        _reverse_contour(char_retina, L3, L2, L1, L0),
+                        class_id,
+                    ))
 
                     if class_id >= CHAR_CLASS_OFFSET:
                         word_text.append(class_to_char(class_id))
@@ -301,8 +329,9 @@ def run_inference(model, image_path, output_path, device,
         print(f"  Line {li+1}: {text}")
 
     # Visualize
-    _visualize(page_img, page_regions, all_para_contours, all_line_contours,
-               all_word_contours, all_char_contours, output_path)
+    _visualize(page_img, all_page_contours, all_para_contours,
+               all_line_contours, all_word_contours, all_char_contours,
+               output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -315,22 +344,21 @@ def _draw_contour(draw, contour, color, width=2):
     pts = contour + [contour[0]]  # close it
     for i in range(len(pts) - 1):
         draw.line([pts[i], pts[i + 1]], fill=color, width=width)
-    # Draw vertices as small dots
     for x, y in contour:
         r = max(1, width)
         draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
 
 
-def _visualize(page_img, page_regions, para_contours, line_contours,
+def _visualize(page_img, page_contours, para_contours, line_contours,
                word_contours, char_contours, output_path):
     vis = page_img.copy()
     draw = ImageDraw.Draw(vis)
 
-    for page_contour, _ in page_regions:
+    for page_contour, _ in page_contours:
         _draw_contour(draw, page_contour, (128, 0, 255), width=4)
 
-    for pc in para_contours:
-        _draw_contour(draw, pc, (255, 0, 0), width=3)
+    for para_contour, _ in para_contours:
+        _draw_contour(draw, para_contour, (255, 0, 0), width=3)
 
     for lc in line_contours:
         _draw_contour(draw, lc, (0, 0, 255), width=2)
@@ -350,7 +378,7 @@ def _visualize(page_img, page_regions, para_contours, line_contours,
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="ContourOCRNet (V2) inference")
+        description="ContourOCRNet (V4) inference")
     parser.add_argument("--model-path", default="model_04.pth")
     parser.add_argument("--output", default="infer_04_output.png")
     parser.add_argument("--page-width", type=int, default=2048)
