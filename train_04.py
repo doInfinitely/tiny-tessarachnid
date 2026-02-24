@@ -347,19 +347,33 @@ class ContourSequenceDataset(Dataset):
         return self._build_sequence(img_t, elements, level_id=0)
 
     def _make_para_sequence(self, page):
-        retina, scale, ox, oy = scale_and_pad(page.image, page.bg_color)
+        # Build page contour in page-global coords
+        page_contour_global = getattr(page, "page_contour", [])
+        if page_contour_global:
+            bx1, by1 = page.page_bbox[0], page.page_bbox[1]
+            page_contour_global = [(x + bx1, y + by1) for x, y in page_contour_global]
+        else:
+            # Fallback: use page bbox as a rectangle contour
+            w, h = page.image.size
+            page_contour_global = [(0, 0), (w, 0), (w, h), (0, h)]
+
+        # Forward cascade: crop page region from page, rotate upright, scale+pad
+        retina, xf = forward_cascade_step(page.image, page_contour_global, page.bg_color)
         img_t = torch.from_numpy(np.array(retina)).permute(2, 0, 1).float() / 255.0
 
         elements = []
         for para in page.paragraphs:
             contour = para.get("contour", [])
-            if contour:
-                # Contour is mask-local; shift to page coords for page-level retina
-                px1, py1 = para["bbox"][0], para["bbox"][1]
-                page_contour = [(x + px1, y + py1) for x, y in contour]
-                steps = self._contour_steps(page_contour, CLASS_PARAGRAPH, scale, ox, oy)
-                if steps:
-                    elements.append(steps)
+            if not contour:
+                continue
+            # Contour is mask-local; shift to page-global coords
+            px1, py1 = para["bbox"][0], para["bbox"][1]
+            global_contour = [(x + px1, y + py1) for x, y in contour]
+            # Map through forward transform to retina coords
+            retina_contour = forward_contour(global_contour, xf)
+            steps = self._contour_steps_from_retina(retina_contour, CLASS_PARAGRAPH)
+            if steps:
+                elements.append(steps)
 
         return self._build_sequence(img_t, elements, level_id=1)
 
