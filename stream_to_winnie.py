@@ -136,17 +136,33 @@ def import_to_winnie(annotation_dirs):
     """Import annotation directories into winnie-interface."""
     if not annotation_dirs:
         return True
-    cmd = [
-        "npx", "tsx", "scripts/seed.ts", "--import",
-    ] + annotation_dirs
+    # Use node directly via node_modules to avoid npx caching issues
+    seed_script = os.path.join(WINNIE_DIR, "scripts", "seed.ts")
+    tsx_bin = os.path.join(WINNIE_DIR, "node_modules", ".bin", "tsx")
+    if not os.path.exists(tsx_bin):
+        tsx_bin = "npx"
+        cmd = [tsx_bin, "tsx", seed_script, "--import"] + annotation_dirs
+    else:
+        cmd = [tsx_bin, seed_script, "--import"] + annotation_dirs
     result = subprocess.run(
         cmd, cwd=WINNIE_DIR, capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
         print(f"  Import error: {result.stderr[:200]}", flush=True)
         return False
-    print(result.stdout.strip(), flush=True)
-    return True
+    # Check for actual "Imported:" line in output
+    stdout = result.stdout.strip()
+    if "Imported:" in stdout:
+        for line in stdout.split("\n"):
+            if "Imported:" in line:
+                print(f"  {line.strip()}", flush=True)
+        return True
+    elif "Done." in stdout:
+        print(f"  {stdout}", flush=True)
+        return True
+    else:
+        print(f"  Import output: {stdout[:200]}", flush=True)
+        return False
 
 
 def stream(source_dir, batch_size=5, poll_interval=5, max_batches=None,
