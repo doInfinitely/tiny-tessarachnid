@@ -569,13 +569,8 @@ class ContourLoss(nn.Module):
                  + self.intersect_weight * intersect_loss)
         return total, pt_loss, orient_loss, cls_loss, intersect_loss
 
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
     def _intersection_loss(self, point_pred, non_none):
-        """Soft intersection penalty for predicted contour segments.
-
-        For each sample in the batch, checks non-adjacent segment pairs
-        for intersection using the signed-area cross-product method.
-        Vectorized: all pair-wise cross products computed in a single pass.
-        """
         B, S, _ = point_pred.shape
         total_loss = torch.tensor(0.0, device=point_pred.device)
         count = 0
@@ -758,6 +753,7 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
         warmup_epochs=0, on_save=None):
     best_val_loss = float("inf")
     epochs_no_improve = 0
+    scaler = torch.amp.GradScaler("cuda")
 
     if scheduler is None:
         if warmup_epochs > 0 and epochs > warmup_epochs:
@@ -797,17 +793,20 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
             level_ids = level_ids.to(device)
             pad_mask = pad_mask.to(device)
 
-            point_pred, orient_pred, class_pred = model(
-                img, prev_seq, start_pt, level_ids, pad_mask,
-            )
-            total, pt_l, ori_l, cls_l, int_l = loss_fn(
-                point_pred, orient_pred, class_pred, target_seq, pad_mask,
-            )
+            with torch.amp.autocast("cuda"):
+                point_pred, orient_pred, class_pred = model(
+                    img, prev_seq, start_pt, level_ids, pad_mask,
+                )
+                total, pt_l, ori_l, cls_l, int_l = loss_fn(
+                    point_pred, orient_pred, class_pred, target_seq, pad_mask,
+                )
 
-            total.backward()
+            scaler.scale(total).backward()
             if grad_clip > 0:
+                scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             opt.zero_grad()
 
             n = img.size(0)
@@ -827,7 +826,7 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
         # -- Validate --
         model.eval()
         v_total, v_pt, v_ori, v_cls, v_int, v_n = 0, 0, 0, 0, 0, 0
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda"):
             for img, prev_seq, target_seq, start_pt, level_ids, pad_mask in valid_dl:
                 img = img.to(device)
                 prev_seq = prev_seq.to(device)
@@ -1060,12 +1059,12 @@ if __name__ == "__main__":
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size,
         shuffle=(sampler is None), sampler=sampler,
-        num_workers=2, pin_memory=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         collate_fn=contour_collate_fn,
     )
     val_dl = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         collate_fn=contour_collate_fn,
     )
 

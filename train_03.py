@@ -554,6 +554,7 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
         on_save=None):
     best_val_loss = float("inf")
     epochs_no_improve = 0
+    scaler = torch.amp.GradScaler("cuda")
 
     if scheduler is None:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -577,17 +578,20 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
             level_ids = level_ids.to(device)
             padding_mask = padding_mask.to(device)
 
-            bbox_pred, class_pred, hw_pred = model(
-                img, prev_seq, level_ids, padding_mask,
-            )
-            total, bbox_loss, cls_loss, hw_loss = loss_fn(
-                bbox_pred, class_pred, hw_pred, target_seq, padding_mask,
-            )
+            with torch.amp.autocast("cuda"):
+                bbox_pred, class_pred, hw_pred = model(
+                    img, prev_seq, level_ids, padding_mask,
+                )
+                total, bbox_loss, cls_loss, hw_loss = loss_fn(
+                    bbox_pred, class_pred, hw_pred, target_seq, padding_mask,
+                )
 
-            total.backward()
+            scaler.scale(total).backward()
             if grad_clip > 0:
+                scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             opt.zero_grad()
 
             n = img.size(0)
@@ -605,7 +609,7 @@ def fit(epochs, model, loss_fn, opt, train_dl, valid_dl, device, save_path,
         # -- Validate --
         model.eval()
         val_total, val_bbox, val_cls, val_hw, val_n = 0.0, 0.0, 0.0, 0.0, 0
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda"):
             for img, prev_seq, target_seq, level_ids, padding_mask in valid_dl:
                 img = img.to(device)
                 prev_seq = prev_seq.to(device)
@@ -965,12 +969,12 @@ if __name__ == "__main__":
 
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=2, pin_memory=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         collate_fn=sequence_collate_fn,
     )
     val_dl = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         collate_fn=sequence_collate_fn,
     )
 
