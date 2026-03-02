@@ -327,6 +327,10 @@ def call_gpt4o_vision(client, image, system_prompt, user_prompt,
             content = resp.choices[0].message.content
             return json.loads(content)
         except Exception as e:
+            err_str = str(e)
+            if "insufficient_quota" in err_str or "billing" in err_str:
+                log.error("OpenAI quota exhausted — aborting: %s", e)
+                raise SystemExit(1)
             wait = 2 ** attempt
             log.warning("GPT-4o call failed (attempt %d/%d): %s — retrying in %ds",
                         attempt + 1, max_retries, e, wait)
