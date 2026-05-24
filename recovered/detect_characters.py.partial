@@ -1,0 +1,239 @@
+"""
+Multi-scale sliding window character detector using HierarchicalCharNet.
+
+Strides a fixed-size window across a page image at multiple scales, classifies
+each window via the two-stage hierarchical model, maps detections back to page
+coordinates, and applies NMS to produce final character bounding boxes.
+
+Usage:
+  from detect_characters import detect_characters, load_detector
+  detector = load_detector("model_02_char.pth")
+  detections = detect_characters(page_image, detector)
+  # detections: list of {"bbox": [x1,y1,x2,y2], "char": str, "confidence": float}
+
+CLI:
+  .venv/bin/python detect_characters.py image.png --model model_02_char.pth --visualize
+"""
+
+import argparse
+import hashlib
+import os
+import random
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchvision.ops
+from PIL import Image, ImageDraw, ImageFont
+
+
+# Mega-block threshold: blocks with more chars than this use embedding retrieval
+MEGA_BLOCK_THRESHOLD = 256
+
+
+# ---------------------------------------------------------------------------
+# Hangul jamo decomposition
+# ---------------------------------------------------------------------------
+
+_HANGUL_BASE = 0xAC00
+_HANGUL_END = 0xD7A3
+_N_LEAD = 19
+_N_VOWEL = 21
+_N_TAIL = 28  # 0 = no tail
+
+
+def decompose_hangul(ch):
+    """Decompose a Hangul syllable into (lead, vowel, tail) jamo indices."""
+    code = ord(ch) - _HANGUL_BASE
+    if code < 0 or code > (_HANGUL_END - _HANGUL_BASE):
+        return None
+    lead = code // (_N_VOWEL * _N_TAIL)
+    vowel = (code % (_N_VOWEL * _N_TAIL)) // _N_TAIL
+    tail = code % _N_TAIL
+    return lead, vowel, tail
+
+
+def compose_hangul(lead, vowel, tail):
+    """Compose Hangul syllable from jamo indices."""
+    return chr(_HANGUL_BASE + lead * (_N_VOWEL * _N_TAIL) + vowel * _N_TAIL + tail)
+
+
+# ---------------------------------------------------------------------------
+# Embedding index for mega-blocks
+# ---------------------------------------------------------------------------
+
+class EmbeddingIndex:
+    """Nearest-neighbor index for mega-block character identification.
+
+    For blocks with >MEGA_BLOCK_THRESHOLD characters, the per-block linear
+    head can't learn from limited samples.  Instead, render reference images
+    of each character, extract backbone features, and do cosine similarity
+    at inference time.
+    """
+
+    def __init__(self):
+        self.embeddings = {}   # block_idx -> (n_chars, feat_dim) tensor
+        self.mega_blocks = set()
+
+    def save(self, path):
+# [MISSING LINE 81]
+# [MISSING LINE 82]
+# [MISSING LINE 83]
+# [MISSING LINE 84]
+# [MISSING LINE 85]
+# [MISSING LINE 86]
+# [MISSING LINE 87]
+# [MISSING LINE 88]
+# [MISSING LINE 89]
+# [MISSING LINE 90]
+# [MISSING LINE 91]
+# [MISSING LINE 92]
+# [MISSING LINE 93]
+# [MISSING LINE 94]
+# [MISSING LINE 95]
+# [MISSING LINE 96]
+# [MISSING LINE 97]
+# [MISSING LINE 98]
+# [MISSING LINE 99]
+# [MISSING LINE 100]
+# [MISSING LINE 101]
+# [MISSING LINE 102]
+# [MISSING LINE 103]
+# [MISSING LINE 104]
+# [MISSING LINE 105]
+# [MISSING LINE 106]
+# [MISSING LINE 107]
+# [MISSING LINE 108]
+# [MISSING LINE 109]
+# [MISSING LINE 110]
+# [MISSING LINE 111]
+# [MISSING LINE 112]
+# [MISSING LINE 113]
+# [MISSING LINE 114]
+# [MISSING LINE 115]
+# [MISSING LINE 116]
+# [MISSING LINE 117]
+# [MISSING LINE 118]
+# [MISSING LINE 119]
+# [MISSING LINE 120]
+# [MISSING LINE 121]
+# [MISSING LINE 122]
+# [MISSING LINE 123]
+# [MISSING LINE 124]
+# [MISSING LINE 125]
+# [MISSING LINE 126]
+# [MISSING LINE 127]
+# [MISSING LINE 128]
+# [MISSING LINE 129]
+# [MISSING LINE 130]
+# [MISSING LINE 131]
+# [MISSING LINE 132]
+# [MISSING LINE 133]
+# [MISSING LINE 134]
+# [MISSING LINE 135]
+# [MISSING LINE 136]
+# [MISSING LINE 137]
+# [MISSING LINE 138]
+# [MISSING LINE 139]
+# [MISSING LINE 140]
+# [MISSING LINE 141]
+# [MISSING LINE 142]
+# [MISSING LINE 143]
+# [MISSING LINE 144]
+# [MISSING LINE 145]
+# [MISSING LINE 146]
+# [MISSING LINE 147]
+# [MISSING LINE 148]
+# [MISSING LINE 149]
+# [MISSING LINE 150]
+# [MISSING LINE 151]
+# [MISSING LINE 152]
+# [MISSING LINE 153]
+# [MISSING LINE 154]
+# [MISSING LINE 155]
+# [MISSING LINE 156]
+# [MISSING LINE 157]
+# [MISSING LINE 158]
+# [MISSING LINE 159]
+# [MISSING LINE 160]
+# [MISSING LINE 161]
+# [MISSING LINE 162]
+# [MISSING LINE 163]
+# [MISSING LINE 164]
+# [MISSING LINE 165]
+# [MISSING LINE 166]
+# [MISSING LINE 167]
+# [MISSING LINE 168]
+# [MISSING LINE 169]
+# [MISSING LINE 170]
+# [MISSING LINE 171]
+# [MISSING LINE 172]
+# [MISSING LINE 173]
+# [MISSING LINE 174]
+# [MISSING LINE 175]
+# [MISSING LINE 176]
+# [MISSING LINE 177]
+# [MISSING LINE 178]
+# [MISSING LINE 179]
+# [MISSING LINE 180]
+# [MISSING LINE 181]
+# [MISSING LINE 182]
+# [MISSING LINE 183]
+# [MISSING LINE 184]
+# [MISSING LINE 185]
+# [MISSING LINE 186]
+# [MISSING LINE 187]
+# [MISSING LINE 188]
+# [MISSING LINE 189]
+# [MISSING LINE 190]
+# [MISSING LINE 191]
+# [MISSING LINE 192]
+# [MISSING LINE 193]
+# [MISSING LINE 194]
+# [MISSING LINE 195]
+# [MISSING LINE 196]
+# [MISSING LINE 197]
+# [MISSING LINE 198]
+# [MISSING LINE 199]
+# [MISSING LINE 200]
+# [MISSING LINE 201]
+# [MISSING LINE 202]
+# [MISSING LINE 203]
+# [MISSING LINE 204]
+# [MISSING LINE 205]
+# [MISSING LINE 206]
+# [MISSING LINE 207]
+# [MISSING LINE 208]
+# [MISSING LINE 209]
+# [MISSING LINE 210]
+# [MISSING LINE 211]
+# [MISSING LINE 212]
+# [MISSING LINE 213]
+# [MISSING LINE 214]
+# [MISSING LINE 215]
+# [MISSING LINE 216]
+# [MISSING LINE 217]
+# [MISSING LINE 218]
+# [MISSING LINE 219]
+# [MISSING LINE 220]
+# [MISSING LINE 221]
+# [MISSING LINE 222]
+# [MISSING LINE 223]
+# [MISSING LINE 224]
+# [MISSING LINE 225]
+# [MISSING LINE 226]
+# [MISSING LINE 227]
+# [MISSING LINE 228]
+# [MISSING LINE 229]
+class DetectorConfig:
+    """Configuration for the sliding window character detector."""
+    # Scale pyramid: at scale s, a char that's c pixels becomes c*s pixels
+    scales: tuple = (0.5, 1.0, 2.0, 4.0)
+    # Window size in pixels (at each scale level)
+    window_size: int = 64
+    # Stride as fraction of window size (0.5 = 50% overlap)
+    stride_fraction: float = 0.5
+    # Padding multiplier around window for context
+    pad_multiplier: float = 2.0

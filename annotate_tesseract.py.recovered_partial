@@ -1,0 +1,107 @@
+# PARTIAL RECOVERY from session 0a90eaa8 (2026-03-20..03-23). Read at 2026-03-22T14:46:39Z
+# captured ONLY lines 1-100 of the original file. The CharBox dataclass at the bottom is
+# truncated mid-definition. The rest of the file (chaining pipeline, GPT-2 tuning, main entry
+# point) is lost. Most logic likely lives in glyph-faerie/glyph_faerie/detection/chaining.py
+# which CLAUDE.md says was "Ported from tiny-tessarachnid/annotate_tesseract.py".
+# Rename to .py once you've manually reconstructed the missing tail.
+
+"""
+Annotate real document images using HierarchicalCharNet detector + spatial chaining.
+
+Bottom-up pipeline: multi-scale sliding window detector finds individual
+characters, then spatial chaining groups them into words → lines →
+paragraphs → page region.  GPT-2 perplexity tunes chaining distance
+per document.
+
+Produces the same 5-level nested JSON format as annotate_real.py, enabling
+direct use with the training pipeline.
+
+Usage:
+  .venv/bin/python annotate_tesseract.py image.png --output-dir real_annotations/ --visualize
+  .venv/bin/python annotate_tesseract.py docs_dataset/ --all --output-dir real_annotations/
+  .venv/bin/python annotate_tesseract.py image.png --config '{"char_scan_angle_deg": 20}'
+"""
+
+import os
+import sys
+import json
+import math
+import logging
+import argparse
+from dataclasses import dataclass, asdict, field
+
+import numpy as np
+from PIL import Image
+
+from annotate_real import (
+    build_annotated_page,
+    save_annotations,
+    visualize_annotations,
+    estimate_background_color,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TesseractConfig:
+    # Character → Word chaining (narrow forward cone)
+    # Tuned via GPT-2 perplexity on 8 PDF pages — see git history.
+    char_scan_angle_deg: float = 15.0   # half-angle of forward scan cone
+    char_max_distance_px: float = 0.0   # max gap between char centers
+                                        # (0 = auto: 1.5 × median char width)
+    char_angle_weight: float = 0.3      # penalty weight for angle deviation
+    char_distance_weight: float = 0.7   # penalty weight for distance
+    char_max_vertical_px: float = 0.0   # max vertical distance between char centers
+                                        # (0 = auto: 0.5 × median char height)
+
+    # Word → Line grouping (y-center band clustering)
+    line_band_factor: float = 0.5       # line band half-width as fraction of median
+                                        # word height; words within this band merge
+
+    # Line → Paragraph chaining (wider downward cone)
+    line_scan_angle_deg: float = 45.0
+    line_max_distance_px: float = 100.0
+    line_angle_weight: float = 0.4
+    line_distance_weight: float = 0.6
+
+    # Paragraph grouping
+    para_vertical_gap_factor: float = 3.0  # max gap as multiple of avg line height
+
+    # Detector settings
+    min_confidence: int = 30              # minimum confidence (0-100)
+
+
+# ---------------------------------------------------------------------------
+# Character detection via Tesseract
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CharBox:
+    bbox: list  # [x1, y1, x2, y2]
+    char: str
+    confidence: float
+
+    @property
+    def cx(self):
+        return (self.bbox[0] + self.bbox[2]) / 2.0
+
+    @property
+    def cy(self):
+        return (self.bbox[1] + self.bbox[3]) / 2.0
+
+    @property
+    def width(self):
+        return self.bbox[2] - self.bbox[0]
+
+    @property
+    def height(self):
+        return self.bbox[3] - self.bbox[1]

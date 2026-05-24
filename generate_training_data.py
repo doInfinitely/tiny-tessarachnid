@@ -1084,6 +1084,102 @@ def visualize_sample(img_tensor, prev_tensor, target_tensor, path):
 
 
 # ---------------------------------------------------------------------------
+# 7.5  get_unicode_chars  (BACK-PORTED; used by train_02_char.py)
+# ---------------------------------------------------------------------------
+
+def get_unicode_chars(verbose: bool = True):
+    """Enumerate every Unicode codepoint covered by the project's fonts.
+
+    Returns:
+        chars: sorted list of unique characters (after NFKC normalization)
+        char_to_fonts: dict mapping each char -> list of (font_path, face_idx)
+                       tuples that contain a glyph for it
+
+    Implementation notes:
+    - Iterates every font from ``discover_fonts()``; opens TTC collections face
+      by face (face_idx = position in the collection) and TTF/OTF as single
+      faces (face_idx = 0).
+    - Reads the ``cmap`` table directly via fontTools rather than rendering,
+      which is far faster and avoids "tofu" false positives.
+    - Applies NFKC normalization so canonical variants (e.g. ﬁ → fi, fullwidth
+      digits → ASCII digits) collapse to a single training class.  Multi-char
+      decompositions are dropped, since the classifier predicts a single char
+      per crop.
+    - Reconstructed from the session bash log:
+          "NFKC normalization: merged 2895 variant chars → 61876 unique chars remaining"
+          "Unicode chars: 61876, active blocks: 218"
+      Numbers will only match exactly if the same font set is on the same machine.
+    """
+    import unicodedata
+    from collections import defaultdict
+
+    try:
+        from fontTools.ttLib import TTFont, TTCollection
+    except ImportError as e:
+        raise ImportError(
+            "get_unicode_chars requires the `fonttools` package "
+            "(install with: pip install fonttools)"
+        ) from e
+
+    raw_char_to_fonts: dict[str, list[tuple[str, int]]] = defaultdict(list)
+
+    def _harvest(tt, font_path: str, face_idx: int):
+        try:
+            cmap_table = tt["cmap"]
+        except KeyError:
+            return
+        for sub in cmap_table.tables:
+            try:
+                mapping = sub.cmap or {}
+            except Exception:
+                continue
+            for cp in mapping:
+                if cp <= 0 or cp > 0x10FFFF:
+                    continue
+                # Skip surrogates
+                if 0xD800 <= cp <= 0xDFFF:
+                    continue
+                raw_char_to_fonts[chr(cp)].append((font_path, face_idx))
+
+    for font_path in discover_fonts():
+        try:
+            if font_path.lower().endswith(".ttc"):
+                coll = TTCollection(font_path, lazy=True)
+                for face_idx, tt in enumerate(coll.fonts):
+                    _harvest(tt, font_path, face_idx)
+            else:
+                tt = TTFont(font_path, lazy=True)
+                _harvest(tt, font_path, 0)
+        except Exception:
+            # Some font files are malformed; skip rather than abort.
+            continue
+
+    # NFKC normalization: collapse canonical variants
+    normalized: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    n_merged = 0
+    for ch, font_list in raw_char_to_fonts.items():
+        nch = unicodedata.normalize("NFKC", ch)
+        # Drop multi-char decompositions — classifier predicts one char per crop
+        if len(nch) != 1:
+            continue
+        if nch != ch:
+            n_merged += 1
+        # Dedupe (font_path, face_idx) tuples after merging
+        existing = normalized[nch]
+        existing_set = set(existing) if existing else set()
+        for ff in font_list:
+            if ff not in existing_set:
+                existing.append(ff)
+                existing_set.add(ff)
+
+    chars = sorted(normalized.keys())
+    if verbose:
+        print(f"NFKC normalization: merged {n_merged} variant chars → "
+              f"{len(chars)} unique chars remaining")
+    return chars, dict(normalized)
+
+
+# ---------------------------------------------------------------------------
 # 8. __main__
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

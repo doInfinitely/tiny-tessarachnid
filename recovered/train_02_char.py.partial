@@ -1,0 +1,1270 @@
+# [MISSING LINE 1]
+# [MISSING LINE 2]
+# [MISSING LINE 3]
+# [MISSING LINE 4]
+# [MISSING LINE 5]
+# [MISSING LINE 6]
+# [MISSING LINE 7]
+# [MISSING LINE 8]
+# [MISSING LINE 9]
+# [MISSING LINE 10]
+# [MISSING LINE 11]
+# [MISSING LINE 12]
+# [MISSING LINE 13]
+# [MISSING LINE 14]
+# [MISSING LINE 15]
+# [MISSING LINE 16]
+# [MISSING LINE 17]
+# [MISSING LINE 18]
+# [MISSING LINE 19]
+# [MISSING LINE 20]
+# [MISSING LINE 21]
+# [MISSING LINE 22]
+# [MISSING LINE 23]
+# [MISSING LINE 24]
+# [MISSING LINE 25]
+# [MISSING LINE 26]
+# [MISSING LINE 27]
+# [MISSING LINE 28]
+# [MISSING LINE 29]
+# [MISSING LINE 30]
+# [MISSING LINE 31]
+# [MISSING LINE 32]
+# [MISSING LINE 33]
+# [MISSING LINE 34]
+# [MISSING LINE 35]
+# [MISSING LINE 36]
+# [MISSING LINE 37]
+# [MISSING LINE 38]
+# [MISSING LINE 39]
+# [MISSING LINE 40]
+# [MISSING LINE 41]
+# [MISSING LINE 42]
+# [MISSING LINE 43]
+# [MISSING LINE 44]
+# [MISSING LINE 45]
+# [MISSING LINE 46]
+# [MISSING LINE 47]
+# [MISSING LINE 48]
+# [MISSING LINE 49]
+# [MISSING LINE 50]
+# [MISSING LINE 51]
+# [MISSING LINE 52]
+# [MISSING LINE 53]
+# [MISSING LINE 54]
+# [MISSING LINE 55]
+# [MISSING LINE 56]
+# [MISSING LINE 57]
+# [MISSING LINE 58]
+# [MISSING LINE 59]
+_BACKBONE_CONFIGS = {
+    "resnet18": (models.resnet18, models.ResNet18_Weights.DEFAULT, 512),
+    "resnet34": (models.resnet34, models.ResNet34_Weights.DEFAULT, 512),
+    "resnet50": (models.resnet50, models.ResNet50_Weights.DEFAULT, 2048),
+}
+
+
+class HierarchicalCharNet(nn.Module):
+    """Two-stage hierarchical character classifier.
+
+    Stage 1: predict Unicode block (~264 classes)
+    Stage 2: predict character within the predicted block (per-block heads)
+    """
+
+    def __init__(self, backbone="resnet18", block_to_chars=None):
+        super().__init__()
+        factory, weights, feat_dim = _BACKBONE_CONFIGS[backbone]
+        resnet = factory(weights=weights)
+        self.feat_dim = feat_dim
+
+        # Backbone (same structure as RetinaOCRNet for weight transfer)
+        self.stem = nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+        )
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # ImageNet normalization
+        self.register_buffer(
+            "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+
+        # Stage 1: block classifier
+        self.num_blocks = NUM_BLOCKS
+        self.block_head = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, self.num_blocks),
+        )
+
+        # Stage 2: per-block character heads
+        # block_to_chars: dict mapping block_idx → list of chars in that block
+        self.block_to_chars = block_to_chars or {}
+        self.char_heads = nn.ModuleDict()
+        self.block_sizes = {}  # block_idx → number of chars
+
+        for block_idx, chars in self.block_to_chars.items():
+            if block_idx < 0:  # skip unmapped blocks
+                continue
+            n = len(chars)
+            self.block_sizes[block_idx] = n
+            # Use a compact head — just one linear layer for small blocks,
+            # two for larger ones
+            if n <= 64:
+                head = nn.Linear(feat_dim, n)
+            else:
+                head = nn.Sequential(
+                    nn.Linear(feat_dim, 256),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                    nn.Linear(256, n),
+                )
+            self.char_heads[str(block_idx)] = head
+
+        # Hangul jamo decomposition heads (block 147 = Hangul Syllables)
+        # Instead of 11,172-way classification, predict 3 small components
+        self.hangul_block_idx = 147
+        self.hangul_lead_head = nn.Linear(feat_dim, 19)    # ㄱ-ㅎ
+        self.hangul_vowel_head = nn.Linear(feat_dim, 21)   # ㅏ-ㅣ
+        self.hangul_tail_head = nn.Linear(feat_dim, 28)    # ∅ + ㄱ-ㅎ
+
+    def extract_features(self, img):
+        """Extract backbone features from image tensor."""
+        x = (img - self.img_mean) / self.img_std
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.pool(x)
+        return x.view(x.size(0), -1)  # (B, feat_dim)
+
+    def forward(self, img, block_targets=None):
+        """Forward pass.
+
+        Args:
+            img: (B, 3, H, W) image tensor
+            block_targets: optional (B,) block index targets for teacher-forced
+                          char head selection during training
+
+        Returns:
+            block_logits: (B, num_blocks) raw logits for block classification
+            char_logits_list: list of (indices, logits, block_id) tuples — one per
+                             active block in the batch.
+        """
+        feats = self.extract_features(img)  # (B, feat_dim)
+        block_logits = self.block_head(feats)  # (B, num_blocks)
+
+        # Determine which block each sample belongs to
+        if block_targets is not None:
+            block_ids = block_targets
+        else:
+            block_ids = block_logits.argmax(dim=1)
+
+        # Group samples by block and run per-block heads
+        char_logits_list = []
+        unique_blocks = block_ids.unique()
+        for bid in unique_blocks:
+            bid_int = bid.item()
+            key = str(bid_int)
+            if key not in self.char_heads:
+                continue
+            mask = (block_ids == bid)
+            indices = mask.nonzero(as_tuple=True)[0]
+            block_feats = feats[indices]
+            logits = self.char_heads[key](block_feats)
+            char_logits_list.append((indices, logits, bid_int))
+
+        return block_logits, char_logits_list
+
+    def predict_hangul_jamo(self, feats):
+        """Predict Hangul syllable via jamo decomposition.
+
+        Args:
+            feats: (N, feat_dim) backbone features for Hangul samples
+
+        Returns:
+            local_indices: (N,) index into block_to_chars[147]
+            confs: (N,) confidence scores
+        """
+        lead_logits = self.hangul_lead_head(feats)
+        vowel_logits = self.hangul_vowel_head(feats)
+        tail_logits = self.hangul_tail_head(feats)
+
+        lead_probs = torch.softmax(lead_logits, dim=1)
+        vowel_probs = torch.softmax(vowel_logits, dim=1)
+        tail_probs = torch.softmax(tail_logits, dim=1)
+
+        lead_idx = lead_probs.argmax(dim=1)
+        vowel_idx = vowel_probs.argmax(dim=1)
+        tail_idx = tail_probs.argmax(dim=1)
+
+        lead_conf = lead_probs.max(dim=1).values
+        vowel_conf = vowel_probs.max(dim=1).values
+        tail_conf = tail_probs.max(dim=1).values
+
+        # Compose syllable code points
+        syllable_offsets = lead_idx * 588 + vowel_idx * 28 + tail_idx  # offset from 0xAC00
+        confs = (lead_conf * vowel_conf * tail_conf) ** (1.0 / 3.0)  # geometric mean
+
+        # Map syllable offset to local index in block_to_chars[147]
+        hangul_chars = self.block_to_chars.get(self.hangul_block_idx, [])
+        if not hangul_chars:
+            return torch.zeros_like(lead_idx), torch.zeros_like(lead_conf)
+
+        # Build offset → local_idx mapping
+        char_to_local = {}
+        for li, ch in enumerate(hangul_chars):
+            offset = ord(ch) - 0xAC00
+            char_to_local[offset] = li
+
+        local_indices = torch.zeros_like(lead_idx)
+        for i in range(feats.size(0)):
+            offset = syllable_offsets[i].item()
+            local_indices[i] = char_to_local.get(offset, 0)
+
+        return local_indices, confs
+
+    def predict(self, img):
+        """Inference: return predicted (block_idx, char_local_idx, block_conf, char_conf) per sample."""
+        feats = self.extract_features(img)
+        block_logits = self.block_head(feats)
+        block_probs = torch.softmax(block_logits, dim=1)
+# [MISSING LINE 240]
+# [MISSING LINE 241]
+# [MISSING LINE 242]
+# [MISSING LINE 243]
+# [MISSING LINE 244]
+# [MISSING LINE 245]
+# [MISSING LINE 246]
+# [MISSING LINE 247]
+# [MISSING LINE 248]
+# [MISSING LINE 249]
+# [MISSING LINE 250]
+# [MISSING LINE 251]
+# [MISSING LINE 252]
+# [MISSING LINE 253]
+# [MISSING LINE 254]
+# [MISSING LINE 255]
+# [MISSING LINE 256]
+# [MISSING LINE 257]
+# [MISSING LINE 258]
+# [MISSING LINE 259]
+# [MISSING LINE 260]
+# [MISSING LINE 261]
+# [MISSING LINE 262]
+# [MISSING LINE 263]
+# [MISSING LINE 264]
+# [MISSING LINE 265]
+# [MISSING LINE 266]
+# [MISSING LINE 267]
+# [MISSING LINE 268]
+# [MISSING LINE 269]
+# [MISSING LINE 270]
+# [MISSING LINE 271]
+# [MISSING LINE 272]
+# [MISSING LINE 273]
+# [MISSING LINE 274]
+# [MISSING LINE 275]
+# [MISSING LINE 276]
+# [MISSING LINE 277]
+# [MISSING LINE 278]
+# [MISSING LINE 279]
+# [MISSING LINE 280]
+# [MISSING LINE 281]
+# [MISSING LINE 282]
+# [MISSING LINE 283]
+# [MISSING LINE 284]
+# [MISSING LINE 285]
+# [MISSING LINE 286]
+# [MISSING LINE 287]
+# [MISSING LINE 288]
+# [MISSING LINE 289]
+# [MISSING LINE 290]
+# [MISSING LINE 291]
+# [MISSING LINE 292]
+# [MISSING LINE 293]
+# [MISSING LINE 294]
+# [MISSING LINE 295]
+# [MISSING LINE 296]
+# [MISSING LINE 297]
+# [MISSING LINE 298]
+# [MISSING LINE 299]
+# [MISSING LINE 300]
+# [MISSING LINE 301]
+# [MISSING LINE 302]
+# [MISSING LINE 303]
+# [MISSING LINE 304]
+# [MISSING LINE 305]
+# [MISSING LINE 306]
+# [MISSING LINE 307]
+# [MISSING LINE 308]
+# [MISSING LINE 309]
+# [MISSING LINE 310]
+# [MISSING LINE 311]
+# [MISSING LINE 312]
+# [MISSING LINE 313]
+# [MISSING LINE 314]
+# [MISSING LINE 315]
+# [MISSING LINE 316]
+# [MISSING LINE 317]
+# [MISSING LINE 318]
+# [MISSING LINE 319]
+# [MISSING LINE 320]
+# [MISSING LINE 321]
+# [MISSING LINE 322]
+# [MISSING LINE 323]
+# [MISSING LINE 324]
+# [MISSING LINE 325]
+# [MISSING LINE 326]
+# [MISSING LINE 327]
+# [MISSING LINE 328]
+# [MISSING LINE 329]
+# [MISSING LINE 330]
+# [MISSING LINE 331]
+# [MISSING LINE 332]
+# [MISSING LINE 333]
+# [MISSING LINE 334]
+# [MISSING LINE 335]
+# [MISSING LINE 336]
+# [MISSING LINE 337]
+# [MISSING LINE 338]
+# [MISSING LINE 339]
+# [MISSING LINE 340]
+# [MISSING LINE 341]
+# [MISSING LINE 342]
+# [MISSING LINE 343]
+# [MISSING LINE 344]
+# [MISSING LINE 345]
+# [MISSING LINE 346]
+# [MISSING LINE 347]
+# [MISSING LINE 348]
+# [MISSING LINE 349]
+# [MISSING LINE 350]
+# [MISSING LINE 351]
+# [MISSING LINE 352]
+# [MISSING LINE 353]
+# [MISSING LINE 354]
+# [MISSING LINE 355]
+# [MISSING LINE 356]
+# [MISSING LINE 357]
+# [MISSING LINE 358]
+# [MISSING LINE 359]
+# [MISSING LINE 360]
+# [MISSING LINE 361]
+# [MISSING LINE 362]
+# [MISSING LINE 363]
+# [MISSING LINE 364]
+# [MISSING LINE 365]
+# [MISSING LINE 366]
+# [MISSING LINE 367]
+# [MISSING LINE 368]
+# [MISSING LINE 369]
+# [MISSING LINE 370]
+# [MISSING LINE 371]
+# [MISSING LINE 372]
+# [MISSING LINE 373]
+# [MISSING LINE 374]
+# [MISSING LINE 375]
+# [MISSING LINE 376]
+# [MISSING LINE 377]
+# [MISSING LINE 378]
+# [MISSING LINE 379]
+# [MISSING LINE 380]
+# [MISSING LINE 381]
+# [MISSING LINE 382]
+# [MISSING LINE 383]
+# [MISSING LINE 384]
+# [MISSING LINE 385]
+# [MISSING LINE 386]
+# [MISSING LINE 387]
+# [MISSING LINE 388]
+# [MISSING LINE 389]
+# [MISSING LINE 390]
+# [MISSING LINE 391]
+# [MISSING LINE 392]
+# [MISSING LINE 393]
+# [MISSING LINE 394]
+# [MISSING LINE 395]
+# [MISSING LINE 396]
+# [MISSING LINE 397]
+# [MISSING LINE 398]
+# [MISSING LINE 399]
+# [MISSING LINE 400]
+# [MISSING LINE 401]
+# [MISSING LINE 402]
+# [MISSING LINE 403]
+# [MISSING LINE 404]
+# [MISSING LINE 405]
+# [MISSING LINE 406]
+# [MISSING LINE 407]
+# [MISSING LINE 408]
+# [MISSING LINE 409]
+# [MISSING LINE 410]
+# [MISSING LINE 411]
+# [MISSING LINE 412]
+# [MISSING LINE 413]
+# [MISSING LINE 414]
+# [MISSING LINE 415]
+# [MISSING LINE 416]
+# [MISSING LINE 417]
+# [MISSING LINE 418]
+# [MISSING LINE 419]
+# [MISSING LINE 420]
+# [MISSING LINE 421]
+# [MISSING LINE 422]
+# [MISSING LINE 423]
+# [MISSING LINE 424]
+# [MISSING LINE 425]
+# [MISSING LINE 426]
+# [MISSING LINE 427]
+# [MISSING LINE 428]
+# [MISSING LINE 429]
+# [MISSING LINE 430]
+# [MISSING LINE 431]
+# [MISSING LINE 432]
+# [MISSING LINE 433]
+# [MISSING LINE 434]
+# [MISSING LINE 435]
+# [MISSING LINE 436]
+# [MISSING LINE 437]
+# [MISSING LINE 438]
+# [MISSING LINE 439]
+# [MISSING LINE 440]
+# [MISSING LINE 441]
+# [MISSING LINE 442]
+# [MISSING LINE 443]
+# [MISSING LINE 444]
+# [MISSING LINE 445]
+# [MISSING LINE 446]
+# [MISSING LINE 447]
+# [MISSING LINE 448]
+# [MISSING LINE 449]
+# [MISSING LINE 450]
+# [MISSING LINE 451]
+# [MISSING LINE 452]
+# [MISSING LINE 453]
+# [MISSING LINE 454]
+# [MISSING LINE 455]
+# [MISSING LINE 456]
+# [MISSING LINE 457]
+# [MISSING LINE 458]
+# [MISSING LINE 459]
+
+
+# ---------------------------------------------------------------------------
+# Parallel rendering
+# ---------------------------------------------------------------------------
+
+_NUM_RENDER_WORKERS = max(1, mp.cpu_count() - 2)
+
+
+def _pool_init():
+    """Re-seed random in forked worker processes."""
+    random.seed(os.getpid() ^ int(time.time() * 1000))
+
+
+def _render_task(args):
+    """Render one character image in a worker process."""
+    ch, font_path, face_idx, font_size, input_size, use_context, sibling_chars = args
+    try:
+        font = ImageFont.truetype(font_path, font_size, index=face_idx)
+    except Exception:
+        return None
+    if use_context and sibling_chars:
+        return _render_char_in_context(ch, font, input_size, sibling_chars)
+    else:
+        return _render_char(ch, font, input_size)
+
+
+def _parallel_render(tasks, desc=""):
+    """Render character images in parallel using multiprocessing Pool."""
+    n = len(tasks)
+    if n == 0:
+        return []
+    print(f"  [{desc}] Rendering {n} images with {_NUM_RENDER_WORKERS} workers...")
+    t0 = time.time()
+    with mp.Pool(_NUM_RENDER_WORKERS, initializer=_pool_init) as pool:
+        results = pool.map(_render_task, tasks, chunksize=64)
+    elapsed = time.time() - t0
+    ok = sum(1 for r in results if r is not None)
+    print(f"  [{desc}] Rendered {ok}/{n} in {elapsed:.0f}s "
+          f"({ok / max(elapsed, 0.1):.0f} img/s)")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Stage A Dataset: Block-balanced (equal samples per block)
+# ---------------------------------------------------------------------------
+
+class BlockBalancedDataset(Dataset):
+    """Renders characters with equal representation per block for block
+    classifier training.  Each block gets `samples_per_block` images,
+    regardless of how many chars are in it.
+    """
+
+    def __init__(self, chars, char_to_fonts, char_to_block_local,
+                 samples_per_block=200, input_size=CHAR_INPUT_SIZE,
+                 block_to_chars=None, context_ratio=0.8):
+        self.input_size = input_size
+        block_chars = defaultdict(list)
+        for ch in chars:
+            if ch == ' ':
+# [MISSING LINE 520]
+# [MISSING LINE 521]
+# [MISSING LINE 522]
+# [MISSING LINE 523]
+# [MISSING LINE 524]
+# [MISSING LINE 525]
+# [MISSING LINE 526]
+# [MISSING LINE 527]
+# [MISSING LINE 528]
+# [MISSING LINE 529]
+# [MISSING LINE 530]
+# [MISSING LINE 531]
+# [MISSING LINE 532]
+# [MISSING LINE 533]
+# [MISSING LINE 534]
+# [MISSING LINE 535]
+# [MISSING LINE 536]
+# [MISSING LINE 537]
+# [MISSING LINE 538]
+# [MISSING LINE 539]
+        self.block_ids = torch.zeros(total_planned, dtype=torch.long)
+        self.local_ids = torch.zeros(total_planned, dtype=torch.long)
+
+        print(f"[BlockBalanced] {len(active_blocks)} blocks × {samples_per_block} spc "
+              f"= {total_planned} samples ({total_planned * 3 * input_size**2 / 1e9:.1f} GB)"
+              f" (context_ratio={context_ratio})",
+              flush=True)
+
+        generated = 0
+        t_start = time.time()
+
+        # Pre-generate all render tasks (2x oversample for failures)
+        tasks = []
+        task_meta = []  # (block_idx, local_idx)
+        for block_idx in active_blocks:
+            chars_in_block = block_chars[block_idx]
+            sibling_chars = _block_char_lists.get(block_idx, [])
+            for _ in range(samples_per_block * 2):
+                ch, local_idx = random.choice(chars_in_block)
+                fonts_for_char = char_to_fonts.get(ch, [])
+                if not fonts_for_char:
+                    continue
+                font_path, face_idx = random.choice(fonts_for_char)
+                font_size = random.randint(14, 60)
+                use_ctx = bool(sibling_chars) and random.random() < context_ratio
+                tasks.append((ch, font_path, face_idx, font_size, input_size,
+                              use_ctx, sibling_chars if use_ctx else None))
+                task_meta.append((block_idx, local_idx))
+
+        results = _parallel_render(tasks, "BlockBalanced")
+
+        # Collect results, respecting per-block limits
+        block_counts = defaultdict(int)
+        for img_t, (block_idx, local_idx) in zip(results, task_meta):
+            if img_t is None:
+                continue
+            if block_counts[block_idx] >= samples_per_block:
+                continue
+            if generated >= total_planned:
+                break
+            self.images[generated] = img_t
+            self.block_ids[generated] = block_idx
+            self.local_ids[generated] = local_idx
+            generated += 1
+            block_counts[block_idx] += 1
+
+        # Trim
+        if generated < total_planned:
+            self.images = self.images[:generated].contiguous()
+            self.block_ids = self.block_ids[:generated]
+# [MISSING LINE 590]
+# [MISSING LINE 591]
+# [MISSING LINE 592]
+# [MISSING LINE 593]
+# [MISSING LINE 594]
+# [MISSING LINE 595]
+# [MISSING LINE 596]
+# [MISSING LINE 597]
+# [MISSING LINE 598]
+# [MISSING LINE 599]
+# [MISSING LINE 600]
+# [MISSING LINE 601]
+# [MISSING LINE 602]
+# [MISSING LINE 603]
+# [MISSING LINE 604]
+# [MISSING LINE 605]
+# [MISSING LINE 606]
+# [MISSING LINE 607]
+# [MISSING LINE 608]
+# [MISSING LINE 609]
+# [MISSING LINE 610]
+# [MISSING LINE 611]
+# [MISSING LINE 612]
+# [MISSING LINE 613]
+# [MISSING LINE 614]
+# [MISSING LINE 615]
+# [MISSING LINE 616]
+# [MISSING LINE 617]
+# [MISSING LINE 618]
+# [MISSING LINE 619]
+# [MISSING LINE 620]
+# [MISSING LINE 621]
+# [MISSING LINE 622]
+# [MISSING LINE 623]
+# [MISSING LINE 624]
+# [MISSING LINE 625]
+# [MISSING LINE 626]
+# [MISSING LINE 627]
+# [MISSING LINE 628]
+# [MISSING LINE 629]
+            samples_per_char: target samples per character
+            max_block_size: skip blocks with more chars than this
+                           (they'd take too long and too much memory)
+            block_to_chars: dict mapping block_idx → list of chars (for context)
+            context_ratio: fraction of samples rendered in-context (0.0-1.0)
+        """
+        self.input_size = input_size
+        block_chars = defaultdict(list)
+        for ch in chars:
+            if ch == ' ':
+                continue
+            if ch not in char_to_block_local:
+                continue
+            block_idx, local_idx = char_to_block_local[ch]
+            if block_idx < 0:
+                continue
+            block_chars[block_idx].append((ch, local_idx))
+
+        # Build block char lists for in-context rendering
+        _block_char_lists = {}
+        if block_to_chars:
+            _block_char_lists = {bi: [c for c in cs if c != ' ']
+                                 for bi, cs in block_to_chars.items()
+                                 if bi >= 0 and cs}
+
+        # Split blocks into small (full spc) and large (reduced spc)
+        small_blocks = {b: cs for b, cs in block_chars.items()
+                        if len(cs) <= max_block_size and len(cs) > 0}
+        large_blocks = {b: cs for b, cs in block_chars.items()
+                        if len(cs) > max_block_size}
+
+        # Large blocks get fewer samples per char to stay tractable
+        large_spc = max(2, samples_per_char // 10)
+
+        total_planned = (sum(len(cs) for cs in small_blocks.values()) * samples_per_char +
+                         sum(len(cs) for cs in large_blocks.values()) * large_spc)
+
+        self.images = torch.zeros((total_planned, 3, input_size, input_size),
+                                  dtype=torch.uint8)
+        self.block_ids = torch.zeros(total_planned, dtype=torch.long)
+        self.local_ids = torch.zeros(total_planned, dtype=torch.long)
+
+        print(f"[CharBalanced] {len(small_blocks)} small blocks × {samples_per_char} spc, "
+              f"{len(large_blocks)} large blocks × {large_spc} spc "
+              f"= {total_planned} samples ({total_planned * 3 * input_size**2 / 1e9:.1f} GB)"
+              f" (context_ratio={context_ratio})",
+              flush=True)
+
+        generated = 0
+        t_start = time.time()
+        all_blocks = list(small_blocks.items()) + list(large_blocks.items())
+
+        # Pre-generate all render tasks (2x oversample for failures)
+        tasks = []
+        task_meta = []  # (block_idx, local_idx, char_key)
+        char_limits = {}
+        for block_idx, chars_in_block in all_blocks:
+            spc = samples_per_char if block_idx in small_blocks else large_spc
+            has_siblings = bool(_block_char_lists.get(block_idx))
+            for ch, local_idx in chars_in_block:
+                fonts_for_char = char_to_fonts.get(ch, [])
+                if not fonts_for_char:
+                    continue
+                char_key = (block_idx, local_idx, ch)
+                char_limits[char_key] = spc
+                for _ in range(spc * 2):
+                    font_path, face_idx = random.choice(fonts_for_char)
+                    font_size = random.randint(14, 60)
+                    use_ctx = has_siblings and random.random() < context_ratio
+                    tasks.append((ch, font_path, face_idx, font_size, input_size,
+                                  use_ctx, block_idx if use_ctx else None))
+                    task_meta.append(char_key)
+
+        results = _parallel_render(tasks, _block_char_lists, "CharBalanced")
+
+        # Collect results, respecting per-char limits
+        char_counts = defaultdict(int)
+        for img_t, char_key in zip(results, task_meta):
+            if img_t is None:
+                continue
+            if char_counts[char_key] >= char_limits.get(char_key, 0):
+                continue
+            if generated >= total_planned:
+                break
+            block_idx, local_idx, _ = char_key
+            self.images[generated] = img_t
+            self.block_ids[generated] = block_idx
+            self.local_ids[generated] = local_idx
+            generated += 1
+            char_counts[char_key] += 1
+
+        # Trim
+        if generated < total_planned:
+            self.images = self.images[:generated].contiguous()
+            self.block_ids = self.block_ids[:generated]
+            self.local_ids = self.local_ids[:generated]
+
+        # Shuffle
+        perm = torch.randperm(generated)
+        self.images = self.images[perm]
+        self.block_ids = self.block_ids[perm]
+        self.local_ids = self.local_ids[perm]
+
+        n_blocks = len(self.block_ids.unique())
+        elapsed = time.time() - t_start
+        print(f"[CharBalanced] Generated {generated} samples across "
+              f"{n_blocks} blocks ({elapsed:.0f}s)", flush=True)
+
+    def __len__(self):
+        return len(self.block_ids)
+
+    def __getitem__(self, idx):
+        return self.images[idx].float() / 255.0, self.block_ids[idx], self.local_ids[idx]
+
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+
+class HierarchicalLoss(nn.Module):
+    """Combined block + within-block character classification loss."""
+
+    def __init__(self, block_weight=1.0, char_weight=1.0):
+        super().__init__()
+        self.block_loss = nn.CrossEntropyLoss()
+        self.char_loss = nn.CrossEntropyLoss()
+        self.block_weight = block_weight
+        self.char_weight = char_weight
+
+# [MISSING LINE 759]
+# [MISSING LINE 760]
+# [MISSING LINE 761]
+# [MISSING LINE 762]
+# [MISSING LINE 763]
+# [MISSING LINE 764]
+# [MISSING LINE 765]
+# [MISSING LINE 766]
+# [MISSING LINE 767]
+# [MISSING LINE 768]
+# [MISSING LINE 769]
+# [MISSING LINE 770]
+# [MISSING LINE 771]
+# [MISSING LINE 772]
+# [MISSING LINE 773]
+# [MISSING LINE 774]
+# [MISSING LINE 775]
+# [MISSING LINE 776]
+# [MISSING LINE 777]
+# [MISSING LINE 778]
+# [MISSING LINE 779]
+# [MISSING LINE 780]
+# [MISSING LINE 781]
+# [MISSING LINE 782]
+# [MISSING LINE 783]
+# [MISSING LINE 784]
+# [MISSING LINE 785]
+# DataParallel training wrapper
+# ---------------------------------------------------------------------------
+
+class _DPTrainWrapper(nn.Module):
+    """Wraps model + loss for DataParallel: computes loss per-GPU, returns scalars."""
+
+    def __init__(self, model, criterion):
+        super().__init__()
+        self.model = model
+        self.criterion = criterion
+
+    def forward(self, imgs, block_targets, char_targets):
+        block_logits, char_logits_list = self.model(imgs, block_targets)
+        loss, lb, lc = self.criterion(block_logits, char_logits_list,
+                                       block_targets, char_targets)
+        with torch.no_grad():
+            bc = (block_logits.argmax(1) == block_targets).sum().float()
+            cc = torch.zeros(1, device=imgs.device)
+            for indices, logits, bid in char_logits_list:
+                t = char_targets[indices]
+                v = t <= (logits.size(1) - 1)
+                if v.sum() > 0:
+                    cc += (logits.argmax(1)[v] == t[v]).sum().float()
+            n = torch.tensor(float(imgs.size(0)), device=imgs.device)
+            stats = torch.stack([bc, cc.squeeze(), n,
+                                 torch.tensor(lb, device=imgs.device),
+                                 torch.tensor(lc, device=imgs.device)])
+        return loss.unsqueeze(0), stats.unsqueeze(0)  # [1], [1, 5]
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+def _make_loader(ds, batch_size, shuffle, num_workers):
+    """Create a DataLoader with optimal settings for in-memory datasets."""
+    pw = num_workers > 0
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=num_workers, pin_memory=True,
+                      drop_last=shuffle, persistent_workers=pw,
+                      prefetch_factor=4 if pw else None)
+
+
+def _wrap_model(model, criterion, gpu_ids):
+    """Create training wrapper, optionally with DataParallel."""
+    wrapper = _DPTrainWrapper(model, criterion)
+    if gpu_ids and len(gpu_ids) > 1:
+        wrapper = nn.DataParallel(wrapper, device_ids=gpu_ids)
+    return wrapper
+
+
+def _run_stages_ab(model, args, chars, char_to_fonts, char_to_block_local,
+                   block_to_chars, device, scaler, total_params,
+                   save_if_best, _save_checkpoint, gpu_ids=None,
+                   block_weights=None):
+    """Run Stage A (block detector) and Stage B (char classifiers)."""
+    nw = args.num_workers
+
+    # ===================================================================
+    # STAGE A: Block detector training (block-balanced)
+    # ===================================================================
+    print(f"\n{'='*60}")
+    print(f"STAGE A: Block detector ({args.block_spc} samples/block, "
+          f"{args.epochs_block} epochs)")
+    print(f"{'='*60}")
+
+    print("Generating block-balanced data...")
+    t0 = time.time()
+    block_ds = BlockBalancedDataset(
+        chars, char_to_fonts, char_to_block_local,
+        samples_per_block=args.block_spc,
+        input_size=args.input_size,
+        block_to_chars=block_to_chars,
+        context_ratio=args.context_ratio,
+        block_weights=block_weights,
+    )
+    print(f"Block dataset: {len(block_ds)} samples in {time.time()-t0:.0f}s")
+
+    val_size = min(5000, len(block_ds) // 10)
+    train_ds, val_ds = random_split(block_ds, [len(block_ds) - val_size, val_size])
+    train_loader = _make_loader(train_ds, args.batch_size, True, nw)
+    val_loader = _make_loader(val_ds, args.batch_size, False, nw)
+
+    # Freeze everything, then unfreeze only block_head
+    for param in model.parameters():
+        param.requires_grad = False
+    for name, param in model.named_parameters():
+        if "block_head" in name:
+            param.requires_grad = True
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable: {trainable:,} / {total_params:,} (block_head only)")
+
+    block_criterion = HierarchicalLoss(block_weight=1.0, char_weight=0.0)
+    wrapper = _wrap_model(model, block_criterion, gpu_ids)
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr_block, weight_decay=1e-4,
+    )
+            param.requires_grad = True
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable: {trainable:,} / {total_params:,} (char_heads only)")
+# [MISSING LINE 890]
+# [MISSING LINE 891]
+# [MISSING LINE 892]
+# [MISSING LINE 893]
+# [MISSING LINE 894]
+# [MISSING LINE 895]
+# [MISSING LINE 896]
+# [MISSING LINE 897]
+# [MISSING LINE 898]
+# [MISSING LINE 899]
+# [MISSING LINE 900]
+# [MISSING LINE 901]
+# [MISSING LINE 902]
+# [MISSING LINE 903]
+# [MISSING LINE 904]
+# [MISSING LINE 905]
+# [MISSING LINE 906]
+# [MISSING LINE 907]
+# [MISSING LINE 908]
+# [MISSING LINE 909]
+# [MISSING LINE 910]
+# [MISSING LINE 911]
+# [MISSING LINE 912]
+# [MISSING LINE 913]
+# [MISSING LINE 914]
+# [MISSING LINE 915]
+# [MISSING LINE 916]
+# [MISSING LINE 917]
+# [MISSING LINE 918]
+# [MISSING LINE 919]
+# [MISSING LINE 920]
+# [MISSING LINE 921]
+# [MISSING LINE 922]
+# [MISSING LINE 923]
+# [MISSING LINE 924]
+# [MISSING LINE 925]
+# [MISSING LINE 926]
+# [MISSING LINE 927]
+# [MISSING LINE 928]
+# [MISSING LINE 929]
+# [MISSING LINE 930]
+# [MISSING LINE 931]
+# [MISSING LINE 932]
+# [MISSING LINE 933]
+# [MISSING LINE 934]
+# [MISSING LINE 935]
+# [MISSING LINE 936]
+# [MISSING LINE 937]
+# [MISSING LINE 938]
+# [MISSING LINE 939]
+# [MISSING LINE 940]
+# [MISSING LINE 941]
+# [MISSING LINE 942]
+# [MISSING LINE 943]
+# [MISSING LINE 944]
+# [MISSING LINE 945]
+# [MISSING LINE 946]
+# [MISSING LINE 947]
+# [MISSING LINE 948]
+# [MISSING LINE 949]
+# [MISSING LINE 950]
+# [MISSING LINE 951]
+# [MISSING LINE 952]
+# [MISSING LINE 953]
+# [MISSING LINE 954]
+# [MISSING LINE 955]
+# [MISSING LINE 956]
+# [MISSING LINE 957]
+# [MISSING LINE 958]
+# [MISSING LINE 959]
+# [MISSING LINE 960]
+# [MISSING LINE 961]
+# [MISSING LINE 962]
+# [MISSING LINE 963]
+# [MISSING LINE 964]
+# [MISSING LINE 965]
+# [MISSING LINE 966]
+# [MISSING LINE 967]
+# [MISSING LINE 968]
+# [MISSING LINE 969]
+# [MISSING LINE 970]
+# [MISSING LINE 971]
+# [MISSING LINE 972]
+# [MISSING LINE 973]
+# [MISSING LINE 974]
+# [MISSING LINE 975]
+# [MISSING LINE 976]
+# [MISSING LINE 977]
+# [MISSING LINE 978]
+# [MISSING LINE 979]
+    """Run one training epoch + validation. Returns (val_block_acc, val_char_acc).
+
+    wrapper: _DPTrainWrapper (optionally wrapped in nn.DataParallel).
+    Returns (loss, stats) where stats = [block_correct, char_correct, n, lb, lc].
+    """
+    wrapper.train()
+    train_loss = 0.0
+    train_block_correct = 0
+    train_char_correct = 0
+    train_total = 0
+
+    for imgs, block_targets, char_targets in train_loader:
+        imgs = imgs.to(device, non_blocking=True)
+        block_targets = block_targets.to(device, non_blocking=True)
+        char_targets = char_targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        if scaler is not None:
+            with torch.amp.autocast("cuda"):
+                loss, stats = wrapper(imgs, block_targets, char_targets)
+            loss = loss.mean()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in wrapper.parameters() if p.requires_grad), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss, stats = wrapper(imgs, block_targets, char_targets)
+            loss = loss.mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in wrapper.parameters() if p.requires_grad), 1.0)
+            optimizer.step()
+
+        s = stats.sum(0) if stats.dim() > 1 else stats
+        train_block_correct += s[0].item()
+        train_char_correct += s[1].item()
+        train_total += int(s[2].item())
+        train_loss += loss.item() * int(s[2].item())
+
+    scheduler.step()
+
+    # Validation
+    wrapper.eval()
+    val_block_correct = 0
+    val_char_correct = 0
+    val_total = 0
+
+    with torch.no_grad():
+        for imgs, block_targets, char_targets in val_loader:
+            imgs = imgs.to(device, non_blocking=True)
+            block_targets = block_targets.to(device, non_blocking=True)
+            char_targets = char_targets.to(device, non_blocking=True)
+            _, stats = wrapper(imgs, block_targets, char_targets)
+            s = stats.sum(0) if stats.dim() > 1 else stats
+            val_block_correct += s[0].item()
+            val_char_correct += s[1].item()
+            val_total += int(s[2].item())
+
+    t_block = train_block_correct / max(1, train_total)
+    t_char = train_char_correct / max(1, train_total)
+    v_block = val_block_correct / max(1, val_total)
+    v_char = val_char_correct / max(1, val_total)
+    avg_loss = train_loss / max(1, train_total)
+
+    print(f"[{phase_name}] Epoch {epoch+1}/{total_epochs}  loss={avg_loss:.4f}  "
+          f"block={t_block:.4f}/{v_block:.4f}  "
+          f"char={t_char:.4f}/{v_char:.4f}  "
+          f"lr={scheduler.get_last_lr()[0]:.6f}")
+
+    return v_block, v_char
+
+
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Detect all available GPUs
+    gpu_ids = None
+    if device.type == "cuda":
+        n_gpus = torch.cuda.device_count()
+        if n_gpus > 1:
+            gpu_ids = list(range(n_gpus))
+            print(f"Device: {device} ({n_gpus} GPUs: {[torch.cuda.get_device_name(i) for i in gpu_ids]})")
+            print(f"DataParallel enabled — effective batch size: {args.batch_size}")
+        else:
+            print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
+    else:
+        print(f"Device: {device}")
+# [MISSING LINE 1070]
+# [MISSING LINE 1071]
+# [MISSING LINE 1072]
+# [MISSING LINE 1073]
+# [MISSING LINE 1074]
+# [MISSING LINE 1075]
+# [MISSING LINE 1076]
+# [MISSING LINE 1077]
+# [MISSING LINE 1078]
+# [MISSING LINE 1079]
+# [MISSING LINE 1080]
+# [MISSING LINE 1081]
+# [MISSING LINE 1082]
+# [MISSING LINE 1083]
+# [MISSING LINE 1084]
+# [MISSING LINE 1085]
+# [MISSING LINE 1086]
+# [MISSING LINE 1087]
+# [MISSING LINE 1088]
+# [MISSING LINE 1089]
+# [MISSING LINE 1090]
+# [MISSING LINE 1091]
+# [MISSING LINE 1092]
+# [MISSING LINE 1093]
+# [MISSING LINE 1094]
+# [MISSING LINE 1095]
+# [MISSING LINE 1096]
+# [MISSING LINE 1097]
+# [MISSING LINE 1098]
+# [MISSING LINE 1099]
+# [MISSING LINE 1100]
+# [MISSING LINE 1101]
+# [MISSING LINE 1102]
+# [MISSING LINE 1103]
+# [MISSING LINE 1104]
+# [MISSING LINE 1105]
+# [MISSING LINE 1106]
+# [MISSING LINE 1107]
+# [MISSING LINE 1108]
+# [MISSING LINE 1109]
+# [MISSING LINE 1110]
+# [MISSING LINE 1111]
+# [MISSING LINE 1112]
+# [MISSING LINE 1113]
+# [MISSING LINE 1114]
+# [MISSING LINE 1115]
+# [MISSING LINE 1116]
+# [MISSING LINE 1117]
+# [MISSING LINE 1118]
+# [MISSING LINE 1119]
+# [MISSING LINE 1120]
+# [MISSING LINE 1121]
+# [MISSING LINE 1122]
+# [MISSING LINE 1123]
+# [MISSING LINE 1124]
+# [MISSING LINE 1125]
+# [MISSING LINE 1126]
+# [MISSING LINE 1127]
+# [MISSING LINE 1128]
+# [MISSING LINE 1129]
+# [MISSING LINE 1130]
+# [MISSING LINE 1131]
+# [MISSING LINE 1132]
+# [MISSING LINE 1133]
+# [MISSING LINE 1134]
+# [MISSING LINE 1135]
+# [MISSING LINE 1136]
+# [MISSING LINE 1137]
+# [MISSING LINE 1138]
+# [MISSING LINE 1139]
+# [MISSING LINE 1140]
+# [MISSING LINE 1141]
+# [MISSING LINE 1142]
+# [MISSING LINE 1143]
+# [MISSING LINE 1144]
+# [MISSING LINE 1145]
+# [MISSING LINE 1146]
+# [MISSING LINE 1147]
+# [MISSING LINE 1148]
+# [MISSING LINE 1149]
+# [MISSING LINE 1150]
+# [MISSING LINE 1151]
+# [MISSING LINE 1152]
+# [MISSING LINE 1153]
+# [MISSING LINE 1154]
+# [MISSING LINE 1155]
+# [MISSING LINE 1156]
+# [MISSING LINE 1157]
+# [MISSING LINE 1158]
+# [MISSING LINE 1159]
+# [MISSING LINE 1160]
+            "Miscellaneous Mathematical Symbols-A": 1000,
+            "Miscellaneous Mathematical Symbols-B": 1000,
+            "Miscellaneous Symbols": 2000,
+            "Miscellaneous Technical": 1000,
+            "Geometric Shapes": 2000,
+            "Box Drawing": 1000, "Block Elements": 1000,
+            "Dingbats": 1000, "Emoticons": 3000,
+        }
+        from create_lists import BLOCK_NAMES
+        block_pop = {}
+        for bi in block_to_chars:
+            if bi < 0 or bi >= len(BLOCK_NAMES):
+                continue
+            name = BLOCK_NAMES[bi]
+            block_pop[bi] = _BLOCK_SPEAKERS_M.get(name, 1)  # 1M default
+        if block_pop:
+            max_pop = max(block_pop.values())
+            block_weights = {bi: max(0.02, pop / max_pop)
+                             for bi, pop in block_pop.items()}
+            top = sorted(block_weights.items(), key=lambda x: -x[1])[:8]
+            print(f"Ecological weights (top 8 by speaker population):")
+            for bi, w in top:
+                print(f"  {BLOCK_NAMES[bi]:40s} weight={w:.2f} "
+                      f"({block_pop[bi]}M speakers)")
+            n_high = sum(1 for w in block_weights.values() if w > 0.3)
+            n_low = sum(1 for w in block_weights.values() if w <= 0.05)
+            print(f"  {n_high} blocks >0.3 weight, {n_low} blocks at minimum")
+
+    def _save_checkpoint(tag=""):
+        """Save current model state unconditionally."""
+        # Unwrap compiled model if needed
+        raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+        torch.save({
+            "model_state_dict": raw.state_dict(),
+            "block_to_chars": block_to_chars,
+            "num_blocks": NUM_BLOCKS,
+            "input_size": args.input_size,
+        }, args.output)
+        print(f"  -> Saved checkpoint{' (' + tag + ')' if tag else ''} to {args.output}")
+
+    def save_if_best(v_block, v_char):
+        nonlocal best_combined
+        combined = 0.3 * v_block + 0.7 * v_char
+        if combined > best_combined:
+            best_combined = combined
+            _save_checkpoint(f"best combined={combined:.4f}")
+
+    if args.resume_stage_c:
+        print("Skipping Stages A & B (--resume-stage-c)")
+    else:
+        _run_stages_ab(model, args, chars, char_to_fonts, char_to_block_local,
+                       block_to_chars, device, scaler, total_params,
+                       save_if_best, _save_checkpoint, gpu_ids=gpu_ids,
+                       block_weights=block_weights)
+
+    # ===================================================================
+    # STAGE C (optional): Joint fine-tune
+    # ===================================================================
+    if args.epochs_joint > 0:
+        print(f"\n{'='*60}")
+        print(f"STAGE C: Joint fine-tune ({args.epochs_joint} epochs)")
+        print(f"{'='*60}")
+
+        # Lazy dataset — renders fresh images every epoch, can't overfit
+        joint_spc = args.joint_spc if args.joint_spc > 0 else args.block_spc
+        print(f"Generating joint training data (lazy, {joint_spc} spc)...")
+        t0 = time.time()
+        joint_ds = CharBalancedDataset(
+            chars, char_to_fonts, char_to_block_local,
+            samples_per_char=joint_spc,
+            max_block_size=1000,
+            input_size=args.input_size,
+            block_to_chars=block_to_chars,
+            context_ratio=args.context_ratio,
+            block_weights=block_weights,
+        )
+        print(f"Joint dataset: {len(joint_ds)} samples in {time.time()-t0:.0f}s")
+
+        # More workers for lazy rendering
+        char_nw = max(args.num_workers, 8)
+        val_size = min(5000, len(joint_ds) // 10)
+        train_ds, val_ds = random_split(joint_ds,
+                                        [len(joint_ds) - val_size, val_size])
+        train_loader = _make_loader(train_ds, args.batch_size, True, char_nw)
+        val_loader = _make_loader(val_ds, args.batch_size, False, char_nw)
+
+        # Unfreeze everything
+        for param in model.parameters():
+            param.requires_grad = True
+
+        joint_criterion = HierarchicalLoss(block_weight=1.0, char_weight=1.0)
+        wrapper = _wrap_model(model, joint_criterion, gpu_ids)
+
+        # Differential LR: backbone low, heads high
+        backbone_params = []
+        head_params = []
+        for name, param in model.named_parameters():
+            if name.startswith(("stem.", "layer1.", "layer2.", "layer3.", "layer4.")):
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+
+        optimizer = torch.optim.AdamW([
+            {"params": backbone_params, "lr": args.lr_joint * 0.1},
+            {"params": head_params, "lr": args.lr_joint},
+        ], weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs_joint)
+
+        for epoch in range(args.epochs_joint):
