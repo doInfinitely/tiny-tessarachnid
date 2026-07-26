@@ -139,6 +139,10 @@ class DetectorConfig:
     scales: tuple = (0.5, 1.0, 2.0, 4.0)
     # Window size in pixels (at each scale level)
     window_size: int = 64
+    # Window aspect ratios (width/height). Area is held ~constant at
+    # window_size^2 so the aspect-preserving resize sees a consistent glyph
+    # scale. 1.0 = square; <1 = tall/thin (l, i, f, t); >1 = wide (m, w).
+    aspect_ratios: tuple = (0.5, 1.0, 2.0)
     # Stride as fraction of window size (0.5 = 50% overlap)
     stride_fraction: float = 0.5
     # Padding multiplier around window for context
@@ -272,7 +276,12 @@ def load_detector(checkpoint, device, embedding_index_data=None):
 # ---------------------------------------------------------------------------
 
 def _extract_windows(page_image, config):
-    """Extract sliding windows at multiple scales.
+    """Extract sliding windows at multiple scales and aspect ratios.
+
+    For each scale, windows are emitted at every aspect ratio in
+    config.aspect_ratios (width/height), with area held ~constant at
+    window_size^2. Non-square windows let thin glyphs (l, i, t) and wide
+    glyphs (m, w) be framed tightly instead of swallowing their neighbors.
 
     Returns:
         windows: list of PIL Images
@@ -281,8 +290,9 @@ def _extract_windows(page_image, config):
     """
     page_w, page_h = page_image.size
     ws = config.window_size
-    stride = int(ws * config.stride_fraction)
-    pad_px = int(ws * config.pad_multiplier)
+    sf = config.stride_fraction
+    pad_mult = config.pad_multiplier
+    aspect_ratios = getattr(config, "aspect_ratios", (1.0,))
 
     windows = []
     window_bboxes = []
@@ -291,39 +301,48 @@ def _extract_windows(page_image, config):
     for scale in config.scales:
         scaled_w = int(page_w * scale)
         scaled_h = int(page_h * scale)
-        if scaled_w < ws or scaled_h < ws:
+        if scaled_w < 1 or scaled_h < 1:
             continue
 
         scaled_img = page_image.resize((scaled_w, scaled_h), Image.LANCZOS)
-        scaled_arr = np.array(scaled_img)
 
-        for y in range(0, scaled_h - ws + 1, stride):
-            for x in range(0, scaled_w - ws + 1, stride):
-                wx1, wy1 = x, y
-                wx2, wy2 = x + ws, y + ws
+        for ar in aspect_ratios:
+            # Constant-area rectangle: ww*wh ~= ws*ws, ww/wh == ar.
+            ww = max(1, int(round(ws * (ar ** 0.5))))
+            wh = max(1, int(round(ws / (ar ** 0.5))))
+            if scaled_w < ww or scaled_h < wh:
+                continue
 
-                px1 = max(0, wx1 - pad_px)
-                py1 = max(0, wy1 - pad_px)
-                px2 = min(scaled_w, wx2 + pad_px)
-                py2 = min(scaled_h, wy2 + pad_px)
+            stride_x = max(1, int(ww * sf))
+            stride_y = max(1, int(wh * sf))
+            pad_x = int(ww * pad_mult)
+            pad_y = int(wh * pad_mult)
 
-                crop = scaled_img.crop((px1, py1, px2, py2))
+            for y in range(0, scaled_h - wh + 1, stride_y):
+                for x in range(0, scaled_w - ww + 1, stride_x):
+                    wx1, wy1 = x, y
+                    wx2, wy2 = x + ww, y + wh
 
-                crop_arr = np.array(crop)
-                corners = []
-                h, w = crop_arr.shape[:2]
-                for cy, cx in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
-                    corners.append(crop_arr[cy, cx])
-                bg_color = tuple(int(v) for v in np.median(corners, axis=0))
+                    px1 = max(0, wx1 - pad_x)
+                    py1 = max(0, wy1 - pad_y)
+                    px2 = min(scaled_w, wx2 + pad_x)
+                    py2 = min(scaled_h, wy2 + pad_y)
 
-                windows.append(crop)
-                window_bg_colors.append(bg_color)
+                    crop = scaled_img.crop((px1, py1, px2, py2))
 
-                page_x1 = wx1 / scale
-                page_y1 = wy1 / scale
-                page_x2 = wx2 / scale
-                page_y2 = wy2 / scale
-                window_bboxes.append([page_x1, page_y1, page_x2, page_y2])
+                    crop_arr = np.array(crop)
+                    corners = []
+                    h, w = crop_arr.shape[:2]
+                    for cy, cx in [(0, 0), (0, w - 1),
+                                   (h - 1, 0), (h - 1, w - 1)]:
+                        corners.append(crop_arr[cy, cx])
+                    bg_color = tuple(int(v) for v in np.median(corners, axis=0))
+
+                    windows.append(crop)
+                    window_bg_colors.append(bg_color)
+
+                    window_bboxes.append([wx1 / scale, wy1 / scale,
+                                          wx2 / scale, wy2 / scale])
 
     return windows, window_bboxes, window_bg_colors
 

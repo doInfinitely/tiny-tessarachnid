@@ -39,6 +39,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -392,9 +393,12 @@ def _parallel_render(tasks, block_char_lists=None, desc=""):
         return []
     print(f"  [{desc}] Rendering {n} images with {_NUM_RENDER_WORKERS} workers...")
     t0 = time.time()
-    with mp.Pool(_NUM_RENDER_WORKERS,
-                 initializer=_pool_init,
-                 initargs=(block_char_lists or {},)) as pool:
+    # CUDA is initialized in the parent before this runs; fork would deadlock
+    # the workers, so use spawn for isolation.
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(_NUM_RENDER_WORKERS,
+                  initializer=_pool_init,
+                  initargs=(block_char_lists or {},)) as pool:
         results = pool.map(_render_task, tasks, chunksize=64)
     elapsed = time.time() - t0
     ok = sum(1 for r in results if r is not None)
@@ -415,7 +419,8 @@ class BlockBalancedDataset(Dataset):
 
     def __init__(self, chars, char_to_fonts, char_to_block_local,
                  samples_per_block=200, input_size=CHAR_INPUT_SIZE,
-                 block_to_chars=None, context_ratio=0.8):
+                 block_to_chars=None, context_ratio=0.8,
+                 block_weights=None):
         self.input_size = input_size
         block_chars = defaultdict(list)
         for ch in chars:
@@ -438,7 +443,8 @@ class BlockBalancedDataset(Dataset):
 
         # Active blocks = blocks with at least one renderable char
         active_blocks = [bi for bi, cs in block_chars.items() if cs]
-        total_planned = len(active_blocks) * samples_per_block
+        block_target = {bi: samples_per_block for bi in active_blocks}
+        total_planned = sum(block_target.values())
         self.images = torch.zeros((total_planned, 3, input_size, input_size),
                                   dtype=torch.uint8)
 # [/RECONSTRUCTED]
@@ -459,7 +465,7 @@ class BlockBalancedDataset(Dataset):
         for block_idx in active_blocks:
             chars_in_block = block_chars[block_idx]
             has_siblings = bool(_block_char_lists.get(block_idx))
-            for _ in range(samples_per_block * 2):
+            for _ in range(block_target[block_idx] * 2):
                 ch, local_idx = random.choice(chars_in_block)
                 fonts_for_char = char_to_fonts.get(ch, [])
                 if not fonts_for_char:
@@ -478,7 +484,7 @@ class BlockBalancedDataset(Dataset):
         for img_t, (block_idx, local_idx) in zip(results, task_meta):
             if img_t is None:
                 continue
-            if block_counts[block_idx] >= samples_per_block:
+            if block_counts[block_idx] >= block_target[block_idx]:
                 continue
             if generated >= total_planned:
                 break
@@ -620,7 +626,8 @@ class SlidingWindowDataset(Dataset):
     and stores the matched crops as training data. Zero domain gap.
     """
 
-    def __init__(self, fonts, num_pages=100, input_size=CHAR_INPUT_SIZE,
+    def __init__(self, fonts, char_to_block_local, num_pages=100,
+                 input_size=CHAR_INPUT_SIZE,
                  scales=(0.5, 1.0, 2.0), min_iou=0.3,
                  page_width=1024, page_height=1400):
         from detect_characters import _extract_windows, DetectorConfig, \
@@ -742,16 +749,27 @@ class SlidingWindowDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class HierarchicalLoss(nn.Module):
-    """Combined block + within-block character classification loss."""
+    """Combined block + within-block character classification loss.
 
-    def __init__(self, block_weight=1.0, char_weight=1.0):
+    When `block_weight_vector` (shape: (NUM_BLOCKS,)) is provided, both the
+    block-head cross-entropy and the per-group char-loss averaging are weighted
+    by it — common scripts dominate gradient capacity for the backbone.
+    """
+
+    def __init__(self, block_weight=1.0, char_weight=1.0,
+                 block_weight_vector=None):
         super().__init__()
-        self.block_loss = nn.CrossEntropyLoss()
+        if block_weight_vector is not None:
+            self.register_buffer("block_class_weights", block_weight_vector)
+            # Python-side copy for cheap per-group lookups in forward()
+            self._block_weights_cpu = block_weight_vector.cpu().tolist()
+        else:
+            self.block_class_weights = None
+            self._block_weights_cpu = None
         self.char_loss = nn.CrossEntropyLoss()
         self.block_weight = block_weight
         self.char_weight = char_weight
 
-# [RECONSTRUCTED lines 759-785 — HierarchicalLoss.forward]
     def forward(self, block_logits, char_logits_list, block_targets, char_targets):
         """Returns (loss, block_loss_value, char_loss_value).
 
@@ -760,20 +778,23 @@ class HierarchicalLoss(nn.Module):
         block_targets: (B,) ground-truth block indices
         char_targets: (B,) ground-truth local char indices
         """
-        block_loss = self.block_loss(block_logits, block_targets)
+        block_loss = F.cross_entropy(block_logits, block_targets,
+                                     weight=self.block_class_weights)
 
         char_loss = torch.zeros((), device=block_logits.device)
-        n_groups = 0
-        for indices, logits, _bid in char_logits_list:
+        total_w = 0.0
+        for indices, logits, bid in char_logits_list:
             tgt = char_targets[indices]
             # Skip out-of-range targets (defensive; shouldn't happen with correct data)
             valid = tgt < logits.size(1)
             if valid.sum() == 0:
                 continue
-            char_loss = char_loss + self.char_loss(logits[valid], tgt[valid])
-            n_groups += 1
-        if n_groups > 0:
-            char_loss = char_loss / n_groups
+            w = (self._block_weights_cpu[bid]
+                 if self._block_weights_cpu is not None else 1.0)
+            char_loss = char_loss + w * self.char_loss(logits[valid], tgt[valid])
+            total_w += w
+        if total_w > 0:
+            char_loss = char_loss / total_w
 
         total = self.block_weight * block_loss + self.char_weight * char_loss
         return total, float(block_loss.item()), float(char_loss.item())
@@ -818,10 +839,13 @@ class _DPTrainWrapper(nn.Module):
 def _make_loader(ds, batch_size, shuffle, num_workers):
     """Create a DataLoader with optimal settings for in-memory datasets."""
     pw = num_workers > 0
+    # CUDA is initialized in the main process, so workers must use spawn
+    # rather than fork to avoid CUDA-fork deadlock.
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=True,
                       drop_last=shuffle, persistent_workers=pw,
-                      prefetch_factor=4 if pw else None)
+                      prefetch_factor=4 if pw else None,
+                      multiprocessing_context="spawn" if pw else None)
 
 
 def _wrap_model(model, criterion, gpu_ids):
@@ -835,7 +859,7 @@ def _wrap_model(model, criterion, gpu_ids):
 def _run_stages_ab(model, args, chars, char_to_fonts, char_to_block_local,
                    block_to_chars, device, scaler, total_params,
                    save_if_best, _save_checkpoint, gpu_ids=None,
-                   block_weights=None):
+                   block_weights=None, block_weight_vector=None):
     """Run Stage A (block detector) and Stage B (char classifiers)."""
     nw = args.num_workers
 
@@ -874,7 +898,8 @@ def _run_stages_ab(model, args, chars, char_to_fonts, char_to_block_local,
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable: {trainable:,} / {total_params:,} (block_head only)")
 
-    block_criterion = HierarchicalLoss(block_weight=1.0, char_weight=0.0)
+    block_criterion = HierarchicalLoss(block_weight=1.0, char_weight=0.0,
+                                       block_weight_vector=block_weight_vector)
     wrapper = _wrap_model(model, block_criterion, gpu_ids)
 
     optimizer = torch.optim.AdamW(
@@ -929,7 +954,8 @@ def _run_stages_ab(model, args, chars, char_to_fonts, char_to_block_local,
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable: {trainable:,} / {total_params:,} (char_heads only)")
 
-    char_criterion = HierarchicalLoss(block_weight=0.0, char_weight=1.0)
+    char_criterion = HierarchicalLoss(block_weight=0.0, char_weight=1.0,
+                                      block_weight_vector=block_weight_vector)
     wrapper = _wrap_model(model, char_criterion, gpu_ids)
 
     optimizer = torch.optim.AdamW(
@@ -1144,6 +1170,16 @@ def train(args):
             n_low = sum(1 for w in block_weights.values() if w <= 0.05)
             print(f"  {n_high} blocks >0.3 weight, {n_low} blocks at minimum")
 
+    # Per-block weight tensor consumed by HierarchicalLoss (block-head class
+    # weights + per-group char-loss averaging). None when --ecological is off.
+    block_weight_vector = None
+    if block_weights:
+        bwv = torch.ones(NUM_BLOCKS, device=device)
+        for bi, w in block_weights.items():
+            if 0 <= bi < NUM_BLOCKS:
+                bwv[bi] = w
+        block_weight_vector = bwv
+
     def _save_checkpoint(tag=""):
         """Save current model state unconditionally."""
         # Unwrap compiled model if needed
@@ -1169,7 +1205,8 @@ def train(args):
         _run_stages_ab(model, args, chars, char_to_fonts, char_to_block_local,
                        block_to_chars, device, scaler, total_params,
                        save_if_best, _save_checkpoint, gpu_ids=gpu_ids,
-                       block_weights=block_weights)
+                       block_weights=block_weights,
+                       block_weight_vector=block_weight_vector)
 
     # ===================================================================
     # STAGE C (optional): Joint fine-tune
@@ -1187,7 +1224,8 @@ def train(args):
             from generate_training_data import discover_fonts as _discover_fonts
             sw_fonts = _discover_fonts()
             joint_ds = SlidingWindowDataset(
-                sw_fonts, num_pages=args.sw_pages,
+                sw_fonts, char_to_block_local,
+                num_pages=args.sw_pages,
                 input_size=args.input_size,
                 scales=(0.5, 1.0, 2.0),
                 min_iou=0.2,
@@ -1216,7 +1254,8 @@ def train(args):
         for param in model.parameters():
             param.requires_grad = True
 
-        joint_criterion = HierarchicalLoss(block_weight=1.0, char_weight=1.0)
+        joint_criterion = HierarchicalLoss(block_weight=1.0, char_weight=1.0,
+                                           block_weight_vector=block_weight_vector)
         wrapper = _wrap_model(model, joint_criterion, gpu_ids)
 
         # Differential LR: backbone low, heads high

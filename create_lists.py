@@ -1,6 +1,16 @@
-from __future__ import annotations
+"""Character list and font mapping utilities for OCR training.
+
+Provides two character sets:
+- ``create_character_list()`` — legacy ~530 Latin/Greek/math chars (backward compat)
+- ``create_unicode_character_list()`` — full Unicode coverage from installed fonts
+"""
 
 import os
+import unicodedata
+
+# ---------------------------------------------------------------------------
+# Legacy functions
+# ---------------------------------------------------------------------------
 
 def create_font_list():
     output = []
@@ -11,6 +21,7 @@ def create_font_list():
             if f not in exclude:
                 output.append(os.path.join(root,f))
     return output
+
 
 def create_character_list():
     """Return ~530 characters for OCR class labels.
@@ -38,115 +49,41 @@ def create_character_list():
 
     # Mathematical operators (selected, ~50 chars)
     _math_ops = [
-        0x2200,  # FOR ALL
-        0x2202,  # PARTIAL DIFFERENTIAL
-        0x2203,  # THERE EXISTS
-        0x2205,  # EMPTY SET
-        0x2207,  # NABLA
-        0x2208,  # ELEMENT OF
-        0x2209,  # NOT AN ELEMENT OF
-        0x220B,  # CONTAINS AS MEMBER
-        0x220F,  # N-ARY PRODUCT
-        0x2211,  # N-ARY SUMMATION
-        0x2212,  # MINUS SIGN
-        0x2215,  # DIVISION SLASH
-        0x2217,  # ASTERISK OPERATOR
-        0x221A,  # SQUARE ROOT
-        0x221D,  # PROPORTIONAL TO
-        0x221E,  # INFINITY
-        0x2220,  # ANGLE
-        0x2227,  # LOGICAL AND
-        0x2228,  # LOGICAL OR
-        0x2229,  # INTERSECTION
-        0x222A,  # UNION
-        0x222B,  # INTEGRAL
-        0x222C,  # DOUBLE INTEGRAL
-        0x222D,  # TRIPLE INTEGRAL
-        0x2234,  # THEREFORE
-        0x2235,  # BECAUSE
-        0x223C,  # TILDE OPERATOR
-        0x2248,  # ALMOST EQUAL TO
-        0x2260,  # NOT EQUAL TO
-        0x2261,  # IDENTICAL TO
-        0x2264,  # LESS-THAN OR EQUAL TO
-        0x2265,  # GREATER-THAN OR EQUAL TO
-        0x226A,  # MUCH LESS-THAN
-        0x226B,  # MUCH GREATER-THAN
-        0x2282,  # SUBSET OF
-        0x2283,  # SUPERSET OF
-        0x2286,  # SUBSET OF OR EQUAL TO
-        0x2287,  # SUPERSET OF OR EQUAL TO
-        0x228E,  # MULTISET UNION
-        0x2291,  # SQUARE IMAGE OF OR EQUAL TO
-        0x2292,  # SQUARE ORIGINAL OF OR EQUAL TO
-        0x2295,  # CIRCLED PLUS
-        0x2297,  # CIRCLED TIMES
-        0x22A2,  # RIGHT TACK (proves)
-        0x22A3,  # LEFT TACK
-        0x22A5,  # UP TACK (perpendicular)
-        0x22C5,  # DOT OPERATOR
-        0x22C6,  # STAR OPERATOR
-        0x22EE,  # VERTICAL ELLIPSIS
-        0x22EF,  # MIDLINE HORIZONTAL ELLIPSIS
+        0x2200, 0x2202, 0x2203, 0x2205, 0x2207, 0x2208, 0x2209, 0x220B,
+        0x220F, 0x2211, 0x2212, 0x2215, 0x2217, 0x221A, 0x221D, 0x221E,
+        0x2220, 0x2227, 0x2228, 0x2229, 0x222A, 0x222B, 0x222C, 0x222D,
+        0x2234, 0x2235, 0x223C, 0x2248, 0x2260, 0x2261, 0x2264, 0x2265,
+        0x226A, 0x226B, 0x2282, 0x2283, 0x2286, 0x2287, 0x228E, 0x2291,
+        0x2292, 0x2295, 0x2297, 0x22A2, 0x22A3, 0x22A5, 0x22C5, 0x22C6,
+        0x22EE, 0x22EF,
     ]
     chars.extend(chr(x) for x in _math_ops)
 
     # Arrows (selected, ~12 chars)
     _arrows = [
-        0x2190,  # LEFTWARDS ARROW
-        0x2191,  # UPWARDS ARROW
-        0x2192,  # RIGHTWARDS ARROW
-        0x2193,  # DOWNWARDS ARROW
-        0x2194,  # LEFT RIGHT ARROW
-        0x2195,  # UP DOWN ARROW
-        0x21A6,  # RIGHTWARDS ARROW FROM BAR (mapsto)
-        0x21D0,  # LEFTWARDS DOUBLE ARROW
-        0x21D1,  # UPWARDS DOUBLE ARROW
-        0x21D2,  # RIGHTWARDS DOUBLE ARROW
-        0x21D3,  # DOWNWARDS DOUBLE ARROW
-        0x21D4,  # LEFT RIGHT DOUBLE ARROW
+        0x2190, 0x2191, 0x2192, 0x2193, 0x2194, 0x2195,
+        0x21A6, 0x21D0, 0x21D1, 0x21D2, 0x21D3, 0x21D4,
     ]
     chars.extend(chr(x) for x in _arrows)
 
     # Letterlike symbols (selected, ~15 chars)
     _letterlike = [
-        0x210F,  # PLANCK CONSTANT OVER TWO PI (hbar)
-        0x2111,  # SCRIPT CAPITAL I (imaginary part)
-        0x2113,  # SCRIPT SMALL L (ell)
-        0x2115,  # DOUBLE-STRUCK CAPITAL N
-        0x2119,  # DOUBLE-STRUCK CAPITAL P
-        0x211A,  # DOUBLE-STRUCK CAPITAL Q
-        0x211D,  # DOUBLE-STRUCK CAPITAL R
-        0x2124,  # DOUBLE-STRUCK CAPITAL Z
-        0x212C,  # SCRIPT CAPITAL B
-        0x2130,  # SCRIPT CAPITAL E
-        0x2131,  # SCRIPT CAPITAL F
-        0x210B,  # SCRIPT CAPITAL H
-        0x2110,  # SCRIPT CAPITAL I
-        0x2112,  # SCRIPT CAPITAL L
-        0x2133,  # SCRIPT CAPITAL M
+        0x210F, 0x2111, 0x2113, 0x2115, 0x2119, 0x211A, 0x211D, 0x2124,
+        0x212C, 0x2130, 0x2131, 0x210B, 0x2110, 0x2112, 0x2133,
     ]
     chars.extend(chr(x) for x in _letterlike)
 
     # Multiplication / division signs
-    chars.append(chr(0x00D7))  # MULTIPLICATION SIGN (already in Latin-1 block above)
-    chars.append(chr(0x00F7))  # DIVISION SIGN (already in Latin-1 block above)
+    chars.append(chr(0x00D7))
+    chars.append(chr(0x00F7))
 
     # Typographic punctuation
-    _typographic = [
-        0x2026,  # HORIZONTAL ELLIPSIS
-        0x2013,  # EN DASH
-        0x2014,  # EM DASH
-        0x2018,  # LEFT SINGLE QUOTATION MARK
-        0x2019,  # RIGHT SINGLE QUOTATION MARK
-        0x201C,  # LEFT DOUBLE QUOTATION MARK
-        0x201D,  # RIGHT DOUBLE QUOTATION MARK
-    ]
+    _typographic = [0x2026, 0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D]
     chars.extend(chr(x) for x in _typographic)
 
     # Prime marks
-    chars.append(chr(0x2032))  # PRIME
-    chars.append(chr(0x2033))  # DOUBLE PRIME
+    chars.append(chr(0x2032))
+    chars.append(chr(0x2033))
 
     # Deduplicate while preserving order (ASCII first)
     seen = set()
@@ -158,22 +95,37 @@ def create_character_list():
 
     return deduped
 
+# Alias for backward compat
+create_character_list_legacy = create_character_list
+
 
 # ---------------------------------------------------------------------------
-# Unicode block table (back-ported from glyph-faerie/glyph_faerie/detection/blocks.py)
-#
-# Provides the block → char mapping used by HierarchicalCharNet in
-# train_02_char.py.  See blocks.py for the source-of-truth implementation.
+# Unicode block utilities
 # ---------------------------------------------------------------------------
 
-import unicodedata as _unicodedata  # noqa: F401  (kept for future NFKC use)
+# Unicode block ranges (name → (start, end)) — covers all blocks through Unicode 15.1
+# We define them programmatically from unicodedata when possible, but the block
+# boundaries themselves must be hard-coded since Python's unicodedata doesn't
+# expose block ranges directly.
 
-# ---------------------------------------------------------------------------
-# Unicode block table
-# ---------------------------------------------------------------------------
+def _get_unicode_block(cp):
+    """Return the Unicode block name for codepoint *cp*.
+
+    Uses a lookup against the standard block boundaries.
+    """
+    for name, (start, end) in _UNICODE_BLOCKS:
+        if start <= cp <= end:
+            return name
+    return "Unknown"
+
 
 def _build_block_table():
-    """Build Unicode block table from standard block boundaries."""
+    """Build Unicode block table from the Blocks.txt-style ranges.
+
+    Returns list of (name, (start, end)) sorted by start.
+    """
+    # Major blocks — sufficient for classification grouping.
+    # We don't need every single block, just enough to group chars sensibly.
     blocks = [
         ("Basic Latin", 0x0000, 0x007F),
         ("Latin-1 Supplement", 0x0080, 0x00FF),
@@ -335,7 +287,7 @@ def _build_block_table():
         ("Arabic Presentation Forms-B", 0xFE70, 0xFEFF),
         ("Halfwidth and Fullwidth Forms", 0xFF00, 0xFFEF),
         ("Specials", 0xFFF0, 0xFFFF),
-        # Supplementary Multilingual Plane
+        # Supplementary Multilingual Plane (SMP)
         ("Linear B Syllabary", 0x10000, 0x1007F),
         ("Linear B Ideograms", 0x10080, 0x100FF),
         ("Aegean Numbers", 0x10100, 0x1013F),
@@ -358,7 +310,7 @@ def _build_block_table():
         ("Caucasian Albanian", 0x10530, 0x1056F),
         ("Vithkuqi", 0x10570, 0x105BF),
         ("Latin Extended-F", 0x10780, 0x107BF),
-        ("Cyrillic Extended-D", 0x10800, 0x1083F),
+        ("Cyrillic Extended-D", 0x10800, 0x1083F),  # reused range
         ("Old Turkic", 0x10C00, 0x10C4F),
         ("Old Hungarian", 0x10C80, 0x10CFF),
         ("Hanifi Rohingya", 0x10D00, 0x10D3F),
@@ -465,14 +417,14 @@ def _build_block_table():
         ("Chess Symbols", 0x1FA00, 0x1FA6F),
         ("Symbols and Pictographs Extended-A", 0x1FA70, 0x1FAFF),
         ("Symbols for Legacy Computing", 0x1FB00, 0x1FBFF),
-        # Supplementary Ideographic Plane
+        # Supplementary Ideographic Plane (SIP)
         ("CJK Unified Ideographs Extension B", 0x20000, 0x2A6DF),
         ("CJK Unified Ideographs Extension C", 0x2A700, 0x2B73F),
         ("CJK Unified Ideographs Extension D", 0x2B740, 0x2B81F),
         ("CJK Unified Ideographs Extension E", 0x2B820, 0x2CEAF),
         ("CJK Unified Ideographs Extension F", 0x2CEB0, 0x2EBEF),
         ("CJK Compatibility Ideographs Supplement", 0x2F800, 0x2FA1F),
-        # Tertiary Ideographic Plane
+        # Tertiary Ideographic Plane (TIP)
         ("CJK Unified Ideographs Extension G", 0x30000, 0x3134F),
         ("CJK Unified Ideographs Extension H", 0x31350, 0x323AF),
     ]
@@ -481,45 +433,197 @@ def _build_block_table():
 
 _UNICODE_BLOCKS = _build_block_table()
 
+# Build name→index mapping
 BLOCK_NAMES = [name for name, _ in _UNICODE_BLOCKS]
 BLOCK_NAME_TO_IDX = {name: i for i, name in enumerate(BLOCK_NAMES)}
 NUM_BLOCKS = len(BLOCK_NAMES)
 
 
-def get_unicode_block(cp: int) -> str:
-    """Return the Unicode block name for codepoint *cp*."""
-    for name, (start, end) in _UNICODE_BLOCKS:
-        if start <= cp <= end:
-            return name
-    return "Unknown"
+# ---------------------------------------------------------------------------
+# Full Unicode character list from installed fonts
+# ---------------------------------------------------------------------------
+
+def _scan_font_codepoints(font_path, face_index=0):
+    """Extract all renderable codepoints from a font file using fonttools cmap."""
+    try:
+        from fontTools.ttLib import TTFont
+        font = TTFont(font_path, fontNumber=face_index)
+        cmap = font.getBestCmap()
+        if cmap is None:
+            font.close()
+            return set()
+        cps = set(cmap.keys())
+        font.close()
+        return cps
+    except Exception:
+        return set()
 
 
-def get_block_index(ch: str) -> int:
-    """Return the block index (0-based) for a character, or -1."""
-    name = get_unicode_block(ord(ch))
+def create_unicode_character_list(font_faces=None):
+    """Build full Unicode character list from all installed fonts.
+
+    Args:
+        font_faces: list of (path, face_index) tuples from discover_fonts_all().
+                    If None, scans default font directories.
+
+    Returns:
+        (chars, char_to_fonts, block_char_counts) where:
+        - chars: sorted list of unique characters renderable by ≥1 font
+        - char_to_fonts: dict mapping char → list of (path, face_index)
+        - block_char_counts: dict mapping block_name → number of chars in that block
+    """
+    if font_faces is None:
+        from generate_training_data import discover_fonts_all
+        font_faces = discover_fonts_all(latin_only=False)
+
+    # Scan all fonts for codepoints
+    char_to_fonts = {}  # char → list of (path, face_index)
+    for path, face_idx in font_faces:
+        cps = _scan_font_codepoints(path, face_idx)
+        for cp in cps:
+            # Skip control characters, surrogates, private use, non-characters
+            if cp < 0x20:
+                continue
+            if 0x7F <= cp <= 0x9F:  # C1 controls
+                continue
+            if 0xD800 <= cp <= 0xDFFF:  # surrogates
+                continue
+            if 0xE000 <= cp <= 0xF8FF:  # private use area
+                continue
+            if 0xF0000 <= cp <= 0x10FFFF:  # supplementary private use
+                continue
+            cat = unicodedata.category(chr(cp))
+            if cat.startswith('C'):  # control/format/unassigned
+                continue
+
+            ch = chr(cp)
+            if ch not in char_to_fonts:
+                char_to_fonts[ch] = []
+            char_to_fonts[ch].append((path, face_idx))
+
+    # Sort by codepoint, but ASCII printable first for backward compat
+    all_chars = sorted(char_to_fonts.keys(), key=lambda c: ord(c))
+
+    # Ensure ASCII printable (0x20-0x7E) come first in exact order
+    ascii_chars = [chr(x) for x in range(0x20, 0x7F) if chr(x) in char_to_fonts]
+    non_ascii = [c for c in all_chars if ord(c) >= 0x7F]
+    chars = ascii_chars + non_ascii
+
+    # Count chars per block
+    block_char_counts = {}
+    for ch in chars:
+        block = _get_unicode_block(ord(ch))
+        block_char_counts[block] = block_char_counts.get(block, 0) + 1
+
+    return chars, char_to_fonts, block_char_counts
+
+
+def get_block_for_char(ch):
+    """Return the Unicode block name for a character."""
+    return _get_unicode_block(ord(ch))
+
+
+def get_block_index(ch):
+    """Return the block index (0-based) for a character."""
+    name = _get_unicode_block(ord(ch))
     return BLOCK_NAME_TO_IDX.get(name, -1)
 
 
-def build_block_char_map(chars: list[str]) -> tuple[dict, dict]:
-    """Build mapping from block_index -> list of chars in that block.
+def build_block_char_map(chars):
+    """Build mapping from block_index → list of (char, within_block_index).
 
     Returns:
-        block_to_chars: dict mapping block_idx -> sorted list of chars
-        char_to_block_local: dict mapping char -> (block_idx, local_idx)
+        block_to_chars: dict mapping block_idx → sorted list of chars in that block
+        char_to_block_local: dict mapping char → (block_idx, local_idx_within_block)
     """
     from collections import defaultdict
-
-    block_to_chars: dict[int, list[str]] = defaultdict(list)
+    block_to_chars = defaultdict(list)
     for ch in chars:
         block_idx = get_block_index(ch)
         block_to_chars[block_idx].append(ch)
 
+    # Sort within each block by codepoint
     for block_idx in block_to_chars:
         block_to_chars[block_idx].sort(key=lambda c: ord(c))
 
+    # Build reverse map: char → (block_idx, local_idx)
     char_to_block_local = {}
     for block_idx, block_chars in block_to_chars.items():
         for local_idx, ch in enumerate(block_chars):
             char_to_block_local[ch] = (block_idx, local_idx)
 
     return dict(block_to_chars), char_to_block_local
+
+
+# ---------------------------------------------------------------------------
+# CLI: --stats mode
+# ---------------------------------------------------------------------------
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Character list utilities")
+    parser.add_argument("--stats", action="store_true",
+                        help="Print Unicode character coverage statistics")
+    parser.add_argument("--legacy", action="store_true",
+                        help="Print legacy character list info")
+    args = parser.parse_args()
+
+    if args.legacy:
+        chars = create_character_list()
+        print(f"Legacy character list: {len(chars)} characters")
+        print(f"  ASCII: {sum(1 for c in chars if 0x20 <= ord(c) <= 0x7E)}")
+        print(f"  Non-ASCII: {sum(1 for c in chars if ord(c) > 0x7E)}")
+        return
+
+    if args.stats:
+        print("Scanning all installed fonts for Unicode coverage...")
+        from generate_training_data import discover_fonts_all
+        font_faces = discover_fonts_all(latin_only=False)
+        print(f"Found {len(font_faces)} font faces")
+
+        chars, char_to_fonts, block_counts = create_unicode_character_list(font_faces)
+        print(f"\nTotal renderable characters: {len(chars)}")
+
+        # Block breakdown
+        print(f"\nBlock coverage ({len(block_counts)} blocks with chars):")
+        print(f"{'Block':<50} {'Chars':>7}  {'Fonts>50%':>9}")
+        print("-" * 70)
+        for block_name in BLOCK_NAMES:
+            count = block_counts.get(block_name, 0)
+            if count == 0:
+                continue
+            # Count fonts that cover >50% of chars in this block
+            block_chars = [c for c in chars if _get_unicode_block(ord(c)) == block_name]
+            font_coverage = {}  # (path, idx) → count
+            for ch in block_chars:
+                for font_key in char_to_fonts.get(ch, []):
+                    font_coverage[font_key] = font_coverage.get(font_key, 0) + 1
+            threshold = count * 0.5
+            fonts_over_50 = sum(1 for c in font_coverage.values() if c >= threshold)
+            print(f"  {block_name:<48} {count:>7}  {fonts_over_50:>9}")
+
+        # Build block map for classifier
+        block_to_chars, char_to_block_local = build_block_char_map(chars)
+        active_blocks = len(block_to_chars)
+        max_block_size = max(len(v) for v in block_to_chars.values())
+        print(f"\nBlocks with ≥1 char: {active_blocks}")
+        print(f"Largest block: {max_block_size} chars")
+        # Top 5 blocks by size
+        top_blocks = sorted(block_to_chars.items(),
+                           key=lambda x: len(x[1]), reverse=True)[:10]
+        print("\nTop 10 blocks by size:")
+        for block_idx, block_chars in top_blocks:
+            if block_idx < 0 or block_idx >= len(BLOCK_NAMES):
+                name = "Unknown/Unmapped"
+            else:
+                name = BLOCK_NAMES[block_idx]
+            print(f"  {name}: {len(block_chars)} chars")
+        return
+
+    # Default: print legacy list
+    chars = create_character_list()
+    print(f"Legacy: {len(chars)} chars")
+
+
+if __name__ == "__main__":
+    main()
