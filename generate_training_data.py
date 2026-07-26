@@ -36,10 +36,17 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image, ImageDraw, ImageFont
 
-from create_lists import create_character_list
+from create_lists import (
+    create_character_list,
+    create_unicode_character_list,
+    build_block_char_map,
+    get_block_index,
+    NUM_BLOCKS,
+    BLOCK_NAMES,
+)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (legacy — used by V2/V3/V4 models)
 # ---------------------------------------------------------------------------
 RETINA_SIZE = 1024
 CLASS_NONE = 0
@@ -60,11 +67,76 @@ PREV_BBOX_NONE = (0, 0, 0, 0, CLASS_NONE, 0)  # 6-dim: (x1,y1,x2,y2,class_id,is_
 
 
 # ---------------------------------------------------------------------------
+# Unicode constants (lazy-loaded for the two-stage character classifier)
+# ---------------------------------------------------------------------------
+_unicode_cache = {}
+
+
+def get_unicode_chars():
+    """Lazily build and cache the full Unicode character list + mappings.
+
+    Applies NFKC normalization to merge visually-identical Unicode variants
+    (e.g. Mathematical Alphanumeric '𝖺' → Basic Latin 'a').  Font lists from
+    non-canonical variants are merged into the canonical character so it gets
+    more font variety during training.
+
+    Returns:
+        (unicode_chars, unicode_char_to_fonts, block_to_chars, char_to_block_local)
+    """
+    if "chars" not in _unicode_cache:
+        import unicodedata
+
+        chars, char_to_fonts, _ = create_unicode_character_list()
+
+        # NFKC normalization: merge chars that normalize to a single char
+        # already in the set (e.g. Math Alphanumeric → Basic Latin)
+        chars_set = set(chars)
+        merged = 0
+        to_remove = set()
+        for ch in chars:
+            nfkc = unicodedata.normalize("NFKC", ch)
+            if len(nfkc) == 1 and nfkc != ch and nfkc in chars_set:
+                # Merge font list into the canonical character
+                char_to_fonts[nfkc].extend(char_to_fonts.get(ch, []))
+                to_remove.add(ch)
+                merged += 1
+
+        if merged > 0:
+            chars = [ch for ch in chars if ch not in to_remove]
+            for ch in to_remove:
+                char_to_fonts.pop(ch, None)
+            print(f"NFKC normalization: merged {merged} variant chars "
+                  f"→ {len(chars)} unique chars remaining")
+
+        block_to_chars, char_to_block_local = build_block_char_map(chars)
+        _unicode_cache["chars"] = chars
+        _unicode_cache["char_to_fonts"] = char_to_fonts
+        _unicode_cache["block_to_chars"] = block_to_chars
+        _unicode_cache["char_to_block_local"] = char_to_block_local
+    return (
+        _unicode_cache["chars"],
+        _unicode_cache["char_to_fonts"],
+        _unicode_cache["block_to_chars"],
+        _unicode_cache["char_to_block_local"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Augmentation
 # ---------------------------------------------------------------------------
 def build_augmentation():
     """Photometric augmentations only — no spatial transforms needed since
-    bbox coords are separate from the image tensor."""
+    bbox coords are separate from the image tensor.
+
+    .. deprecated::
+        Use ``augmentation.AugmentedDataset`` instead, which supports both
+        geometric and photometric augmentations with coord transforms.
+    """
+    import warnings
+    warnings.warn(
+        "build_augmentation() is deprecated — use augmentation.AugmentedDataset instead",
+        DeprecationWarning, stacklevel=2,
+    )
     return transforms.Compose([
         transforms.ColorJitter(brightness=0.3, contrast=0.3,
                                saturation=0.3, hue=0.1),
@@ -74,9 +146,19 @@ def build_augmentation():
 
 
 class AugmentedSubset(Dataset):
-    """Wraps a dataset subset and applies photometric augmentation to images."""
+    """Wraps a dataset subset and applies photometric augmentation to images.
+
+    .. deprecated::
+        Use ``augmentation.AugmentedDataset`` instead, which supports both
+        geometric and photometric augmentations with coord transforms.
+    """
 
     def __init__(self, subset, augmentation):
+        import warnings
+        warnings.warn(
+            "AugmentedSubset is deprecated — use augmentation.AugmentedDataset instead",
+            DeprecationWarning, stacklevel=2,
+        )
         self.subset = subset
         self.augmentation = augmentation
 
@@ -144,14 +226,14 @@ def _is_handwriting_font(font_path):
 # ---------------------------------------------------------------------------
 # 1. discover_fonts()
 # ---------------------------------------------------------------------------
-def _font_renders_latin(font_path, size=24):
+def _font_renders_latin(font_path, size=24, face_index=0):
     """Return True if *font_path* renders all printable ASCII glyphs.
 
     Tests every printable ASCII character (32-126). Rejects fonts where
     any character produces no pixels or the same tofu box as others.
     """
     try:
-        font = ImageFont.truetype(font_path, size)
+        font = ImageFont.truetype(font_path, size, index=face_index)
     except Exception:
         return False
 
@@ -173,48 +255,99 @@ def _font_renders_latin(font_path, size=24):
         if arr.max() == 0:
             return False  # character renders as blank
 
-    # Check that a few visually distinct chars don't all produce the same image
-    test_chars = "A", "g", "{", "~"
-    imgs = []
+    # Check that visually distinct chars produce distinct images.
+    # Tofu-box fonts render all missing chars as the same box → caught here.
+    test_chars = list("ABCDGIQagio0O1lI|{}[]!?@#")
+    rendered = []
     for ch in test_chars:
         img = Image.new("L", (size * 2, size * 2), 0)
         draw = ImageDraw.Draw(img)
         draw.text((0, 0), ch, fill=255, font=font)
-        imgs.append(np.array(img))
-    for i in range(1, len(imgs)):
-        if not np.array_equal(imgs[0], imgs[i]):
-            return True
-    return False
+        rendered.append(np.array(img).tobytes())
+    n_unique = len(set(rendered))
+    # Require at least half of the test chars to render distinctly
+    return n_unique >= len(test_chars) // 2
 
 
 def discover_fonts():
-    """Scan the project fonts/ directory for usable Latin font files."""
+    """Scan the project fonts/ directory for usable Latin font files.
+
+    Returns a plain list of font paths (backward-compatible).  Only includes
+    fonts that pass the Latin ASCII rendering test.  For .ttc collections,
+    only face 0 is tested/returned as a plain path.
+    """
+    return [path for path, _idx in discover_fonts_all(latin_only=True)]
+
+
+def discover_fonts_all(latin_only=False):
+    """Scan project fonts/ dir + system Noto dirs for all usable font files.
+
+    Returns list of ``(path, face_index)`` tuples.  .ttc collections are
+    expanded into per-face entries via fonttools.
+
+    If *latin_only* is True, only fonts that pass the Latin ASCII rendering
+    test are included.  If False (default), all loadable font files are
+    returned (including CJK-only fonts).
+    """
     search_dirs = [
         os.path.join(os.path.dirname(__file__), "fonts"),
+        "/usr/share/fonts",
     ]
-    # Skip font families that don't have proper Latin ASCII glyphs
+    # Skip font families that are decorative/symbolic (useless for OCR)
     _skip_prefixes = (
         "Apple Braille", "Apple Symbols", "Bodoni Ornaments",
-        "Diwan", "Farisi", "Gurmukhi", "Hoefler Text Ornaments",
-        "Keyboard", "Khmer", "Kokonor", "Lao", "Mishafi",
-        "NotoSans", "NotoSerif", "PlantagenetCherokee",
-        "SFArabic", "SFArmenian", "SFCamera", "SFGeorgian",
-        "SFHebrew", "Symbol", "Webdings", "Wingdings", "ZapfDingbats",
+        "Hoefler Text Ornaments",
+        "Keyboard", "Kokonor",
+        "SFCamera",
+        "Symbol", "Webdings", "Wingdings", "ZapfDingbats",
     )
     extensions = {".ttf", ".otf", ".ttc"}
-    found = []
+    found = []  # list of (path, face_index)
+    seen = set()  # (path, face_index) dedup
     for d in search_dirs:
         if not os.path.isdir(d):
             continue
         for root, _dirs, files in os.walk(d):
             for f in files:
-                if os.path.splitext(f)[1].lower() in extensions:
-                    if any(f.startswith(p) for p in _skip_prefixes):
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in extensions:
+                    continue
+                if any(f.startswith(p) for p in _skip_prefixes):
+                    continue
+                path = os.path.join(root, f)
+
+                if ext == ".ttc":
+                    # Expand TrueType Collection into individual faces
+                    for face_path, face_idx in _expand_ttc(path):
+                        key = (face_path, face_idx)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        if latin_only and not _font_renders_latin(face_path, face_index=face_idx):
+                            continue
+                        found.append(key)
+                else:
+                    key = (path, 0)
+                    if key in seen:
                         continue
-                    path = os.path.join(root, f)
-                    if _font_renders_latin(path):
-                        found.append(path)
+                    seen.add(key)
+                    if latin_only and not _font_renders_latin(path):
+                        continue
+                    found.append(key)
     return found
+
+
+def _expand_ttc(ttc_path):
+    """Return list of (path, face_index) for each face in a .ttc collection."""
+    try:
+        from fontTools.ttLib import TTCollection
+        ttc = TTCollection(ttc_path)
+        n = len(ttc.fonts)
+        ttc.close()
+        return [(ttc_path, i) for i in range(n)]
+    except Exception:
+        # Fallback: try loading face 0 only
+        return [(ttc_path, 0)]
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +397,12 @@ def _compute_mask(image, bbox, bg_color):
     Uses per-channel max-difference so anti-aliased edges are included.
     """
     x1, y1, x2, y2 = bbox
+    # Clamp to image bounds to avoid PIL "tile cannot extend outside image"
+    w, h = image.size
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 <= x1 or y2 <= y1:
+        return Image.new("L", (max(1, int(bbox[2] - bbox[0])), max(1, int(bbox[3] - bbox[1]))), 0)
     region = image.crop((x1, y1, x2, y2))
     arr = np.array(region, dtype=np.int16)
     bg = np.array(bg_color, dtype=np.int16)
@@ -449,6 +588,36 @@ PREV_CONTOUR_NONE = (0, 0, 0.0, 0.0, CLASS_NONE)  # (x, y, dx, dy, class_id)
 # ---------------------------------------------------------------------------
 # 6. SyntheticPage
 # ---------------------------------------------------------------------------
+def _bbox_iou(b1, b2):
+    """Intersection-over-union of two axis-aligned bboxes."""
+    ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
+    ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    a1 = max(1, (b1[2]-b1[0]) * (b1[3]-b1[1]))
+    a2 = max(1, (b2[2]-b2[0]) * (b2[3]-b2[1]))
+    return inter / (a1 + a2 - inter)
+
+
+def _rotated_para_bbox(para_bbox, angle_deg, page_w, page_h):
+    """Analytically compute the axis-aligned bbox after rotating para_bbox.
+    Mirrors PIL's rotate(expand=True) geometry exactly.
+    """
+    px1, py1, px2, py2 = para_bbox
+    pw, ph = px2 - px1, py2 - py1
+    if pw <= 0 or ph <= 0:
+        return para_bbox
+    rad = math.radians(angle_deg)
+    ca, sa = abs(math.cos(rad)), abs(math.sin(rad))
+    rw = int(pw * ca + ph * sa)
+    rh = int(pw * sa + ph * ca)
+    cx, cy = px1 + pw // 2, py1 + ph // 2
+    paste_x = max(0, min(cx - rw // 2, page_w - rw))
+    paste_y = max(0, min(cy - rh // 2, page_h - rh))
+    return (paste_x, paste_y, paste_x + rw, paste_y + rh)
+
+
 class SyntheticPage:
     """Generate a synthetic page with hierarchical bounding boxes and masks.
 
@@ -475,9 +644,10 @@ class SyntheticPage:
     """
 
     def __init__(self, fonts, page_width=2048, page_height=2800,
-                 rotate_paragraphs=False):
+                 rotate_paragraphs=True, compute_contours=True):
         self.width = page_width
         self.height = page_height
+        self.compute_contours = compute_contours
         self.bg_color = _random_color()
         self.image = Image.new("RGB", (page_width, page_height), self.bg_color)
         self.paragraphs = []
@@ -488,13 +658,30 @@ class SyntheticPage:
         self._generate(fonts)
 
     # -- helpers ----------------------------------------------------------
+    _WORD_LIST = None
+
+    @staticmethod
+    def _get_word_list():
+        if SyntheticPage._WORD_LIST is None:
+            try:
+                with open("/usr/share/dict/words") as f:
+                    # Keep only short ASCII-only alphabetic words for font compat
+                    SyntheticPage._WORD_LIST = [
+                        w.strip() for w in f
+                        if w.strip().isascii() and w.strip().isalpha() and 2 <= len(w.strip()) <= 10
+                    ]
+            except OSError:
+                SyntheticPage._WORD_LIST = []
+        return SyntheticPage._WORD_LIST
+
     @staticmethod
     def _random_word(min_len=1, max_len=10):
+        words = SyntheticPage._get_word_list()
+        if words:
+            return random.choice(words)
         length = random.randint(min_len, max_len)
-        # Use ASCII chars without space (fonts validated for ASCII only)
         ascii_no_space = [ch for ch in ASCII_CHARS if ch != ' ']
-        chars = [random.choice(ascii_no_space) for _ in range(length)]
-        return "".join(chars)
+        return "".join(random.choice(ascii_no_space) for _ in range(length))
 
     @staticmethod
     def _random_line(min_words=2, max_words=10):
@@ -502,11 +689,16 @@ class SyntheticPage:
         return " ".join(SyntheticPage._random_word() for _ in range(n))
 
     def _rotate_paragraph_region(self, para_bbox, angle, lines_data):
-        """Rotate a paragraph region in-place on the page image."""
+        """Rotate a paragraph region in-place on the page image.
+
+        Returns the actual 4-corner quad of the paragraph after rotation
+        as a list of (x, y) float pairs [NW, NE, SE, SW], or None if the
+        paragraph has zero size.
+        """
         px1, py1, px2, py2 = para_bbox
         pw, ph = px2 - px1, py2 - py1
         if pw <= 0 or ph <= 0:
-            return
+            return None
         region = self.image.crop((px1, py1, px2, py2))
         # Erase original region
         bg_patch = Image.new("RGB", (pw, ph), self.bg_color)
@@ -523,32 +715,46 @@ class SyntheticPage:
         paste_x = max(0, min(paste_x, self.width - rw))
         paste_y = max(0, min(paste_y, self.height - rh))
         self.image.paste(rotated, (paste_x, paste_y))
-        # Transform all element bboxes
+        # Transform points: local para coords → page coords after rotation
         rad = math.radians(angle)
         cos_a, sin_a = math.cos(rad), math.sin(rad)
+
         def _rotate_point(x, y):
             rx = x - pw / 2
             ry = y - ph / 2
             nx = rx * cos_a - ry * sin_a + rw / 2 + paste_x
             ny = rx * sin_a + ry * cos_a + rh / 2 + paste_y
-            return int(nx), int(ny)
-        def _rotate_bbox(bbox):
+            return (nx, ny)
+
+        def _rotate_quad(bbox):
+            """Return actual 4 rotated corners (float) for bbox."""
             bx1, by1, bx2, by2 = bbox
-            local = [(bx1 - px1, by1 - py1), (bx2 - px1, by1 - py1),
-                     (bx2 - px1, by2 - py1), (bx1 - px1, by2 - py1)]
-            rotated_pts = [_rotate_point(lx, ly) for lx, ly in local]
-            xs = [p[0] for p in rotated_pts]
-            ys = [p[1] for p in rotated_pts]
-            return (min(xs), min(ys), max(xs), max(ys))
+            corners = [(bx1 - px1, by1 - py1), (bx2 - px1, by1 - py1),
+                       (bx2 - px1, by2 - py1), (bx1 - px1, by2 - py1)]
+            return [_rotate_point(lx, ly) for lx, ly in corners]
+
+        def _rotate_bbox(bbox):
+            pts = _rotate_quad(bbox)
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+
+        para_quad = _rotate_quad(para_bbox)
+
         for ld in lines_data:
+            ld["quad"] = _rotate_quad(ld["bbox"])
             ld["bbox"] = _rotate_bbox(ld["bbox"])
             ld["mask"] = _compute_mask(self.image, ld["bbox"], self.bg_color)
             for wd in ld.get("words", []):
+                wd["quad"] = _rotate_quad(wd["bbox"])
                 wd["bbox"] = _rotate_bbox(wd["bbox"])
                 wd["mask"] = _compute_mask(self.image, wd["bbox"], self.bg_color)
                 for cd in wd.get("characters", []):
+                    cd["quad"] = _rotate_quad(cd["bbox"])
                     cd["bbox"] = _rotate_bbox(cd["bbox"])
-                    cd["mask"] = _compute_mask(self.image, cd["bbox"], self.bg_color)
+                    cd["mask"] = _compute_mask(self.image, cd["bbox"],
+                                               self.bg_color)
+
+        return para_quad
 
     # -- main generation --------------------------------------------------
     def _generate(self, fonts):
@@ -687,40 +893,66 @@ class SyntheticPage:
             para_y2 = int(max(ld["bbox"][3] for ld in lines_data))
             para_bbox = (int(para_x1), int(para_y1), para_x2, para_y2)
 
+            para_quad = None
             if self.rotate_paragraphs:
-                angle = random.uniform(-30, 30)
-                self._rotate_paragraph_region(para_bbox, angle, lines_data)
-                # Recompute para bbox after rotation
-                all_coords = []
-                for ld in lines_data:
-                    b = ld["bbox"]
-                    all_coords.extend([(b[0], b[1]), (b[2], b[3])])
-                if all_coords:
-                    para_x1_new = min(c[0] for c in all_coords)
-                    para_y1_new = min(c[1] for c in all_coords)
-                    para_x2 = max(c[0] for c in all_coords)
-                    para_y2 = max(c[1] for c in all_coords)
-                    para_bbox = (para_x1_new, para_y1_new, para_x2, para_y2)
+                angle = random.uniform(-20, 20)
+                # Check analytically whether the rotated bbox would overlap
+                # any existing paragraph — no image copy needed. ZERO
+                # tolerance with a safety margin: even slight paragraph
+                # overlap puts ghost ink from one paragraph inside another
+                # paragraph's line strips (unreadable collages downstream).
+                expected_bbox = _rotated_para_bbox(
+                    para_bbox, angle, self.width, self.height)
+                m = 12
+                exp_pad = (expected_bbox[0] - m, expected_bbox[1] - m,
+                           expected_bbox[2] + m, expected_bbox[3] + m)
+                overlaps = any(_bbox_iou(exp_pad, p["bbox"]) > 0.0
+                               for p in self.paragraphs)
+                if not overlaps:
+                    para_quad = self._rotate_paragraph_region(
+                        para_bbox, angle, lines_data)
+                    # Recompute para_bbox from rotated child bboxes
+                    all_coords = []
+                    for ld in lines_data:
+                        b = ld["bbox"]
+                        all_coords.extend([(b[0], b[1]), (b[2], b[3])])
+                    if all_coords:
+                        para_bbox = (
+                            min(c[0] for c in all_coords),
+                            min(c[1] for c in all_coords),
+                            max(c[0] for c in all_coords),
+                            max(c[1] for c in all_coords))
 
             para_mask = _compute_mask(self.image, para_bbox, self.bg_color)
 
-            # Compute contours for all elements
-            para_contour = contour_from_mask(para_mask)
-            for ld in lines_data:
-                ld["contour"] = contour_from_mask(ld["mask"])
-                for wd in ld.get("words", []):
-                    wd["contour"] = contour_from_mask(wd["mask"])
-                    for cd in wd.get("characters", []):
-                        cd["contour"] = contour_from_mask(cd["mask"])
+            # Compute contours (expensive — skip for training-only pages)
+            if self.compute_contours:
+                para_contour = contour_from_mask(para_mask)
+                for ld in lines_data:
+                    ld["contour"] = contour_from_mask(ld["mask"])
+                    for wd in ld.get("words", []):
+                        wd["contour"] = contour_from_mask(wd["mask"])
+                        for cd in wd.get("characters", []):
+                            cd["contour"] = contour_from_mask(cd["mask"])
+            else:
+                para_contour = []
 
-            self.paragraphs.append({
+            para_entry = {
                 "bbox": para_bbox,
                 "mask": para_mask,
                 "contour": para_contour,
                 "is_handwritten": _is_handwriting_font(font_path),
+                "font": font_path,
                 "lines": lines_data,
-            })
+            }
+            if para_quad is not None:
+                para_entry["quad"] = para_quad
+            self.paragraphs.append(para_entry)
 
+            # rotation can expand the paragraph far below the pre-rotation
+            # layout cursor — advance from the FINAL bbox or the next
+            # paragraph starts inside this one
+            y_cursor = max(y_cursor, para_bbox[3])
             y_cursor += random.randint(20, 60)
 
         # Compute page-level bounding contour from all paragraph regions
@@ -731,7 +963,8 @@ class SyntheticPage:
             all_y2 = max(p["bbox"][3] for p in self.paragraphs)
             self.page_bbox = (all_x1, all_y1, all_x2, all_y2)
             self.page_mask = _compute_mask(self.image, self.page_bbox, self.bg_color)
-            self.page_contour = contour_from_mask(self.page_mask)
+            self.page_contour = (contour_from_mask(self.page_mask)
+                                 if self.compute_contours else [])
 
 
 # ---------------------------------------------------------------------------
