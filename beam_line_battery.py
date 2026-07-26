@@ -45,11 +45,9 @@ def main():
                 "--two-pass",
             ]
             try:
-                env = dict(os.environ,
-                           PYTHONPATH="/home/remy/Downloads/tiny-tessarachnid")
                 out = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=900,
-                    env=env,
+                    env=dict(os.environ),
                 ).stdout
             except subprocess.TimeoutExpired:
                 results.append((font, line, None, "TIMEOUT"))

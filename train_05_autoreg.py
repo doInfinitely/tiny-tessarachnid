@@ -25,8 +25,6 @@ import os
 import random
 import sys
 
-OLD = os.path.expanduser("~/Downloads/tiny-tessarachnid")
-sys.path.insert(0, OLD)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 import cv2

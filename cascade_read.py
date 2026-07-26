@@ -14,7 +14,6 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.expanduser("~/Code/glyph-faerie"))
-sys.path.insert(0, os.path.expanduser("~/Downloads/tiny-tessarachnid"))
 sys.path.insert(0, HERE)
 
 import numpy as np
