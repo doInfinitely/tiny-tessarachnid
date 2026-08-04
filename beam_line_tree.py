@@ -14,6 +14,7 @@ word-level detector.
 import argparse
 import heapq
 import itertools
+import json
 import math
 import os
 import string
@@ -334,6 +335,41 @@ def detect_font_glyphs(img, T, B, steps, font_paths,
     return scores
 
 
+def detect_writer_glyphs(img, T, B, steps, banks,
+                         min_conf=0.6, max_glyphs=12, size=48):
+    """Writer ID over scribe template banks — the handwriting analog of
+    detect_font_glyphs. banks: {writer_key: {char: [normalized 48px
+    bitmaps]}}. Returns [(score, writer_key)] ranked desc."""
+    cands = [s for s in steps if s[2] != " " and s[3] >= min_conf]
+    cands.sort(key=lambda s: -s[3])
+    cands = cands[:max_glyphs]
+    if not cands:
+        return []
+    targets = []
+    for cur, right, ch, conf in cands:
+        crop = img.crop((cur, T, right, B))
+        arr = np.array(crop.convert("L"))
+        ys, xs = np.where(arr < 200)
+        if len(xs) == 0:
+            continue
+        tight = crop.crop((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+        targets.append((ch, conf, _glyph_bitmap(tight, size)))
+    if not targets:
+        return []
+    scores = []
+    for key, bank in banks.items():
+        total = 0.0
+        for ch, conf, target in targets:
+            best = 0.0
+            for variant in {ch, ch.swapcase()}:
+                for tpl in bank.get(variant, ()):
+                    best = max(best, float((tpl * target).sum()))
+            total += conf * best
+        scores.append((total / len(targets), key))
+    scores.sort(key=lambda s: -s[0])
+    return scores
+
+
 _FONT_TPL_CACHE = {}
 _FALLBACK_CHARS = string.ascii_letters + string.digits
 
@@ -415,6 +451,11 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
     # enough for a ~450px render but starves a 1000px cascade strip
     eff_max_cuts = max(args.max_cuts, (R - L) // 12)
     cuts = find_cuts(comp_labels, L, R, T, B, max_cuts=eff_max_cuts)
+    # handwriting: true boundaries sit inside overlapping ink, not at
+    # density minima — a uniform grid guarantees coverage
+    grid = getattr(args, "cut_grid", None)
+    if grid:
+        cuts = sorted(set(cuts) | set(range(L, R + 1, grid)))
 
     # ---- space candidate edges from zero-ink runs ----
     runs = gap_runs(comp_labels, L, R, T, B)
@@ -521,11 +562,12 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
         for (cur, right), topk in box_topk.items():
             _, _, ink_w = crop_stats[(cur, right)]
             kept = []
+            slack = getattr(args, "cap_slack", 4)
             for ch, conf in topk:
                 expected = glyph_widths.get(ch)
                 if expected is not None and expected > 1:
-                    if (ink_w > expected * width_cap + 4
-                            or ink_w < expected / width_cap - 4):
+                    if (ink_w > expected * width_cap + slack
+                            or ink_w < expected / width_cap - slack):
                         capped += 1
                         continue
                 kept.append((ch, conf))
@@ -567,9 +609,14 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
             for ch, conf in topk:
                 best = 0.0
                 for variant in {ch, ch.swapcase()}:
-                    tpl = _render_glyph(variant, template_font)
-                    if tpl is not None:
-                        best = max(best, float((tpl * target).sum()))
+                    if isinstance(template_font, dict):
+                        # writer bank: {char: [normalized 48px bitmaps]}
+                        for tpl in template_font.get(variant, ()):
+                            best = max(best, float((tpl * target).sum()))
+                    else:
+                        tpl = _render_glyph(variant, template_font)
+                        if tpl is not None:
+                            best = max(best, float((tpl * target).sum()))
                 rescored.append((ch, conf * best, best))
                 if best < args.template_min:
                     dropped += 1
@@ -586,7 +633,9 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
             for key, best in emptied_t:
                 box_topk[key] = [best]
         if verbose:
-            print(f"  template verify ({os.path.basename(template_font)}): "
+            tname = ("writer-bank" if isinstance(template_font, dict)
+                     else os.path.basename(template_font))
+            print(f"  template verify ({tname}): "
                   f"dropped {dropped} candidates, "
                   f"{len(emptied_t)} crops emptied")
 
@@ -947,11 +996,23 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
     if line_h < 6 or R - L < 6:
         return "", None, 0.0
 
-    def priors_for(font_path):
-        gw = {ch: rel * line_h
-              for ch, rel in glyph_width_prior(font_path).items()}
-        sw = space_width_prior(font_path) * line_h
-        return gw, sw
+    hw_priors = getattr(args, "hw_priors", None)
+    if hw_priors:
+        if isinstance(hw_priors, str):
+            with open(hw_priors) as f:
+                hw_priors = json.load(f)
+
+        def priors_for(font_path):
+            # empirical handwriting priors: font is irrelevant
+            gw = {ch: rel * line_h
+                  for ch, rel in hw_priors["glyph_rel"].items()}
+            return gw, hw_priors["space_rel"] * line_h
+    else:
+        def priors_for(font_path):
+            gw = {ch: rel * line_h
+                  for ch, rel in glyph_width_prior(font_path).items()}
+            sw = space_width_prior(font_path) * line_h
+            return gw, sw
 
     glyph_widths, space_w = priors_for("fonts/Arial.ttf")
     completes = decode_line(img, (L, T, R, B), model, lm, device, args,
@@ -964,8 +1025,15 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
     font_score = 0.0
 
     if args.two_pass and hyp:
+        writer_banks = getattr(args, "writer_banks", None)
         if force_font is not None:
             ranked = [(1.0, force_font)]
+        elif writer_banks:
+            steps = unwind_path(completes[0][5])
+            wr = detect_writer_glyphs(img, T, B, steps, writer_banks)
+            ranked = [(sc, writer_banks[key]) for sc, key in wr[:1]]
+            if verbose and wr:
+                print(f"  writer-ID: {wr[0][1]} ({wr[0][0]:.3f})")
         else:
             pool = detection_font_pool(args)
             steps = unwind_path(completes[0][5])
@@ -986,13 +1054,22 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
             det_font = ranked[0][1]
             font_score = ranked[0][0]
             if verbose:
-                print(f"  font: {os.path.basename(det_font)}")
-            glyph_widths, space_w = priors_for(det_font)
+                fname = ("writer-bank" if isinstance(det_font, dict)
+                         else os.path.basename(det_font))
+                print(f"  font: {fname}")
+            glyph_widths, space_w = priors_for(
+                det_font if not isinstance(det_font, dict) else
+                "fonts/Arial.ttf")
             completes2 = decode_line(
                 img, (L, T, R, B), model, lm, device, args,
                 glyph_widths, space_w, width_cap=args.width_cap,
                 template_font=det_font, verbose=verbose)
-            if completes2:
+            if isinstance(det_font, dict):
+                # writer bank: no renderable font for the synthesis
+                # arbitration below — trust the verified pass directly
+                if completes2:
+                    completes = completes2
+            elif completes2:
                 f1 = case_post_pass(
                     img, T, B, unwind_path(completes[0][5]),
                     completes[0][1], lm, ctx=args.context).rstrip()
@@ -1019,7 +1096,8 @@ def default_read_args(**overrides):
              beta_trans=2.5, spacing_slack=5.0, conf_threshold=0.1,
              space_conf=0.9, min_space_frac=0.5, max_cuts=40,
              max_expansions=400000, max_completes=10, cursor_beam=32,
-             pop_batch=8, context="", gpu_batch=128, ascii_only=True)
+             pop_batch=8, context="", gpu_batch=128, ascii_only=True,
+             hw_priors=None, cut_grid=None, writer_banks=None)
     d.update(overrides)
     return argparse.Namespace(**d)
 
