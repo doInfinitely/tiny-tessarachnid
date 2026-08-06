@@ -58,10 +58,19 @@ def main():
     ap.add_argument("--writer-id", action="store_true",
                     help="identify the writer per line via "
                          "detect_writer_glyphs instead of forcing GT")
+    ap.add_argument("--consensus", action="store_true",
+                    help="paragraph-level writer consensus: pool "
+                         "per-line writer votes, re-read dissenting "
+                         "lines with the consensus bank forced")
+    ap.add_argument("--generic-bank", action="store_true",
+                    help="pool ALL writers' templates into one generic "
+                         "bank and force it everywhere (no writer-ID)")
     ap.add_argument("--pages", nargs="+", default=["010", "011"])
     ap.add_argument("--lines-per-para", type=int, default=2)
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
+    if args.consensus:
+        args.writer_id = True
 
     device = torch.device(args.device)
     ck = torch.load(HERE / args.model, map_location=device,
@@ -69,8 +78,20 @@ def main():
     model = load_detector(ck, device, None).model
     lm = IncLM(device)
     banks = None
+    generic = None
     if args.writer_templates:
         banks = torch.load(args.writer_templates, weights_only=False)
+        if args.generic_bank:
+            generic = {}
+            for bank in banks.values():
+                for ch, tpls in bank.items():
+                    generic.setdefault(ch, []).extend(tpls[:4])
+            for ch, tpls in generic.items():
+                if len(tpls) > 24:
+                    step = len(tpls) / 24
+                    generic[ch] = [tpls[int(i * step)] for i in range(24)]
+            print("generic bank:", len(generic), "chars,",
+                  sum(len(v) for v in generic.values()), "templates")
     rargs = default_read_args(
         font_pool="auto",
         two_pass=(banks is not None) or not args.no_two_pass,
@@ -82,30 +103,67 @@ def main():
         writer_banks=banks if (banks is not None and args.writer_id)
         else None)
 
+    def alpha_frac(text):
+        letters = sum(1 for c in text if c.isalpha())
+        return letters / max(1, len(text.replace(" ", "")))
+
+    import re
     tot_e = tot_n = 0
+    n_paras = n_paras_correct = n_rereads = 0
     for pid in args.pages:
         img = Image.open(PAGES / f"page_{pid}.png").convert("RGB")
         gt = json.loads((PAGES / f"page_{pid}.json").read_text())
         for pi, para in enumerate(gt["paragraphs"]):
+            m = re.match(r"scribe_style(\d+)_font(\d+)", para["font"])
+            gt_key = (int(m.group(1)), int(m.group(2)))
             force = None
-            if banks is not None and not args.writer_id:
-                import re
-                m = re.match(r"scribe_style(\d+)_font(\d+)", para["font"])
-                force = banks.get((int(m.group(1)), int(m.group(2))))
-            for li, line in enumerate(para["lines"][:args.lines_per_para]):
+            if generic is not None:
+                force = generic
+            elif banks is not None and not args.writer_id:
+                force = banks.get(gt_key)
+            lines = para["lines"][:args.lines_per_para]
+            crops, gts = [], []
+            for line in lines:
                 x1, y1, x2, y2 = line["bbox"]
-                crop = img.crop((max(0, x1 - 10), max(0, y1 - 8),
-                                 x2 + 10, y2 + 8))
-                gt_text = " ".join(
-                    w["text"] for w in line["words"])
-                text, det_font, _ = read_line(
-                    crop, model, lm, device, rargs, verbose=False,
-                    force_font=force)
-                e = cer(text, gt_text)
-                tot_e += e * len(gt_text)
-                tot_n += len(gt_text)
+                crops.append(img.crop((max(0, x1 - 10), max(0, y1 - 8),
+                                       x2 + 10, y2 + 8)))
+                gts.append(" ".join(w["text"] for w in line["words"]))
+
+            reads = [read_line(c, model, lm, device, rargs, verbose=False,
+                               force_font=force)
+                     for c in crops]
+
+            if args.consensus and banks is not None:
+                # pool per-line writer votes, weighted by ID score and
+                # decode quality (a garbage line must not outvote a
+                # sibling that reads like words)
+                votes = {}
+                for text, key, sc in reads:
+                    if isinstance(key, tuple):
+                        votes[key] = (votes.get(key, 0.0)
+                                      + max(sc, 0.05) * alpha_frac(text) ** 2)
+                if votes:
+                    ckey = max(votes.items(), key=lambda kv: kv[1])[0]
+                    n_paras += 1
+                    n_paras_correct += (ckey == gt_key)
+                    for li, (text, key, sc) in enumerate(reads):
+                        if key != ckey:
+                            n_rereads += 1
+                            t2, _, s2 = read_line(
+                                crops[li], model, lm, device, rargs,
+                                verbose=False, force_font=banks[ckey])
+                            if t2:
+                                reads[li] = (t2, ckey, s2)
+
+            for li, (text, _, _) in enumerate(reads):
+                e = cer(text, gts[li])
+                tot_e += e * len(gts[li])
+                tot_n += len(gts[li])
                 print(f"p{pid}/{pi}.{li} cer={e:.2f}  read={text!r}")
-                print(f"          GT ={gt_text!r}", flush=True)
+                print(f"          GT ={gts[li]!r}", flush=True)
+    if n_paras:
+        print(f"\nconsensus writer-ID: {n_paras_correct}/{n_paras} "
+              f"paragraphs correct, {n_rereads} lines re-read")
     print(f"\nweighted CER = {tot_e / max(1, tot_n):.3f}")
 
 

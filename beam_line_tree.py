@@ -1024,6 +1024,7 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
     det_font = None
     font_score = 0.0
 
+    writer_key = None
     if args.two_pass and hyp:
         writer_banks = getattr(args, "writer_banks", None)
         if force_font is not None:
@@ -1031,7 +1032,11 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
         elif writer_banks:
             steps = unwind_path(completes[0][5])
             wr = detect_writer_glyphs(img, T, B, steps, writer_banks)
-            ranked = [(sc, writer_banks[key]) for sc, key in wr[:1]]
+            if wr:
+                writer_key = wr[0][1]
+                ranked = [(wr[0][0], writer_banks[writer_key])]
+            else:
+                ranked = []
             if verbose and wr:
                 print(f"  writer-ID: {wr[0][1]} ({wr[0][0]:.3f})")
         else:
@@ -1085,6 +1090,10 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
 
     fixed = case_post_pass(img, T, B, unwind_path(completes[0][5]),
                            completes[0][1], lm, ctx=args.context).rstrip()
+    if writer_key is not None:
+        # writer-ID mode: report the hashable writer key (the analog of
+        # a font path) so callers can vote on it; the bank stays internal
+        det_font = writer_key
     return fixed, det_font, font_score
 
 

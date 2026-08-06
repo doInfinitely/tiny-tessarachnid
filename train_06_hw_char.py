@@ -33,8 +33,9 @@ HERE = Path(__file__).resolve().parent
 
 
 class HwCropDataset(Dataset):
-    def __init__(self, crops_dir, records, char_to_local, train=True):
-        self.dir = Path(crops_dir)
+    """records carry absolute paths in rec['path'] (multi-source mixes)."""
+
+    def __init__(self, records, char_to_local, train=True):
         self.records = records
         self.c2l = char_to_local
         self.train = train
@@ -44,7 +45,7 @@ class HwCropDataset(Dataset):
 
     def __getitem__(self, i):
         rec = self.records[i]
-        img = Image.open(self.dir / rec["file"]).convert("L")
+        img = Image.open(rec["path"]).convert("L")
         arr = np.asarray(img, dtype=np.float32) / 255.0
         ink = 1.0 - arr                                # [128,128] 0..1
 
@@ -79,8 +80,8 @@ class HwCropDataset(Dataset):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--crops", default=str(Path.home() /
-                    "Code/palimpsest/Code/palimpsest/data/letter_crops_v1"))
+    ap.add_argument("--crops", nargs="+", default=[str(Path.home() /
+                    "Code/palimpsest/Code/palimpsest/data/letter_crops_v1")])
     ap.add_argument("--init", default="model_02_char.eco100.pth")
     ap.add_argument("--out", default="model_02_char_hw_v1.pth")
     ap.add_argument("--epochs", type=int, default=6)
@@ -101,20 +102,26 @@ def main():
     chars = ck["block_to_chars"][0]
     c2l = {c: i for i, c in enumerate(chars)}
 
-    crops = Path(args.crops)
-    records = [json.loads(l) for l in open(crops / "labels.jsonl")]
-    n_all = len(records)
-    records = [r for r in records if r["char"] in c2l]
-    print(f"{len(records)}/{n_all} crops usable "
-          f"({n_all - len(records)} chars outside ASCII block)")
+    records = []
+    n_all = 0
+    for cdir in args.crops:
+        cdir = Path(cdir)
+        for l in open(cdir / "labels.jsonl"):
+            r = json.loads(l)
+            n_all += 1
+            if r["char"] in c2l:
+                r["path"] = str(cdir / "crops" / r["file"])
+                records.append(r)
+    print(f"{len(records)}/{n_all} crops usable from {len(args.crops)} "
+          f"source(s) ({n_all - len(records)} chars outside ASCII block)")
     random.shuffle(records)
     n_val = max(1000, len(records) // 50)
     val_recs, tr_recs = records[:n_val], records[n_val:]
 
-    tr = DataLoader(HwCropDataset(crops / "crops", tr_recs, c2l, train=True),
+    tr = DataLoader(HwCropDataset(tr_recs, c2l, train=True),
                     batch_size=args.batch, shuffle=True, num_workers=8,
                     pin_memory=True, drop_last=True)
-    va = DataLoader(HwCropDataset(crops / "crops", val_recs, c2l, train=False),
+    va = DataLoader(HwCropDataset(val_recs, c2l, train=False),
                     batch_size=args.batch, shuffle=False, num_workers=4)
 
     head = model.char_heads["0"]
@@ -164,7 +171,7 @@ def main():
                 "block_to_chars": ck["block_to_chars"],
                 "input_size": ck.get("input_size", 128),
                 "hw_finetune": {"epoch": ep, "val_acc": vacc,
-                                "crops": str(crops)},
+                                "crops": list(args.crops)},
             }, HERE / args.out)
             print(f"   saved {args.out} (val_acc={vacc:.4f})", flush=True)
     print(f"done, best val_acc={best:.4f}")
