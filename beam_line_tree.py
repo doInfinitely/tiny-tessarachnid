@@ -456,6 +456,32 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
     grid = getattr(args, "cut_grid", None)
     if grid:
         cuts = sorted(set(cuts) | set(range(L, R + 1, grid)))
+    # learned boundary proposer: per-column boundary probability over the
+    # height-normalized line band; local maxima become candidate cuts
+    cut_net = getattr(args, "cut_net", None)
+    if cut_net is not None:
+        net, net_dev = cut_net
+        band = np.array(img.convert("L").crop((L, T, R, B)),
+                        dtype=np.float32)
+        blo, bbg = band.min(), np.percentile(band, 90)
+        band = np.clip((band - blo) / max(1.0, bbg - blo), 0, 1)
+        hb = band.shape[0]
+        sc = 64.0 / hb
+        Wn = max(8, int(band.shape[1] * sc))
+        strip = np.asarray(Image.fromarray(
+            (band * 255).astype(np.uint8)).resize((Wn, 64)),
+            dtype=np.float32) / 255.0
+        with torch.no_grad():
+            logits = net(torch.from_numpy(1.0 - strip)
+                         .unsqueeze(0).unsqueeze(0).to(net_dev))
+            probs = torch.sigmoid(logits)[0].cpu().numpy()
+        proposed = []
+        thr = getattr(args, "cut_net_thresh", 0.3)
+        for c in range(1, Wn - 1):
+            if (probs[c] >= thr and probs[c] >= probs[c - 1]
+                    and probs[c] >= probs[c + 1]):
+                proposed.append(L + int(round(c / sc)))
+        cuts = sorted(set(cuts) | set(proposed))
 
     # ---- space candidate edges from zero-ink runs ----
     runs = gap_runs(comp_labels, L, R, T, B)
@@ -1106,7 +1132,8 @@ def default_read_args(**overrides):
              space_conf=0.9, min_space_frac=0.5, max_cuts=40,
              max_expansions=400000, max_completes=10, cursor_beam=32,
              pop_batch=8, context="", gpu_batch=128, ascii_only=True,
-             hw_priors=None, cut_grid=None, writer_banks=None)
+             hw_priors=None, cut_grid=None, writer_banks=None,
+             cut_net=None, cut_net_thresh=0.3)
     d.update(overrides)
     return argparse.Namespace(**d)
 

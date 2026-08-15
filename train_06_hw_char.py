@@ -75,7 +75,8 @@ class HwCropDataset(Dataset):
         out = np.empty((3, 128, 128), dtype=np.float32)
         for c in range(3):
             out[c] = (bg * (1 - ink) + tint[c] * ink) / 255.0
-        return torch.from_numpy(out), self.c2l[rec["char"]]
+        w = rec.get("weight", 1.0)
+        return torch.from_numpy(out), self.c2l[rec["char"]], np.float32(w)
 
 
 def main():
@@ -87,6 +88,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--soft-conf", action="store_true",
+                    help="weight each crop's loss by its labels.jsonl "
+                         "conf (floored at --conf-floor); crops without "
+                         "conf get weight 1.0")
+    ap.add_argument("--conf-floor", type=float, default=0.3)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -111,6 +117,9 @@ def main():
             n_all += 1
             if r["char"] in c2l:
                 r["path"] = str(cdir / "crops" / r["file"])
+                if args.soft_conf:
+                    r["weight"] = max(args.conf_floor,
+                                      float(r.get("conf", 1.0)))
                 records.append(r)
     print(f"{len(records)}/{n_all} crops usable from {len(args.crops)} "
           f"source(s) ({n_all - len(records)} chars outside ASCII block)")
@@ -136,13 +145,16 @@ def main():
     for ep in range(args.epochs):
         model.train()
         tot = cor = 0
-        for bi, (x, y) in enumerate(tr):
+        for bi, (x, y, w) in enumerate(tr):
             x, y = x.to(device, non_blocking=True), y.to(device)
+            w = w.to(device)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda"):
                 feats = model.extract_features(x)
                 logits = head(feats)
-                loss = F.cross_entropy(logits, y, label_smoothing=0.05)
+                per = F.cross_entropy(logits, y, label_smoothing=0.05,
+                                      reduction="none")
+                loss = (per * w).sum() / w.sum().clamp(min=1e-6)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
@@ -156,7 +168,7 @@ def main():
         model.eval()
         vt = vc = 0
         with torch.no_grad():
-            for x, y in va:
+            for x, y, _ in va:
                 x, y = x.to(device), y.to(device)
                 logits = head(model.extract_features(x))
                 vt += y.numel()

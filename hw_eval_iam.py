@@ -60,6 +60,9 @@ def main():
     ap.add_argument("--model", default="model_02_char_hw_v2.pth")
     ap.add_argument("--hw-priors", default="hw_priors.json")
     ap.add_argument("--cut-grid", type=int, default=3)
+    ap.add_argument("--cut-model", default=None,
+                    help="BoundaryNet checkpoint; replaces/augments cuts")
+    ap.add_argument("--no-cut-grid", action="store_true")
     ap.add_argument("--generic-bank", default=None,
                     help=".pt writer bank file to pool into one generic "
                          "bank forced on every line")
@@ -86,9 +89,20 @@ def main():
                 step = len(tpls) / 24
                 force[ch] = [tpls[int(i * step)] for i in range(24)]
 
+    cut_net = None
+    if args.cut_model:
+        from train_07_boundary import BoundaryNet
+        bn = BoundaryNet().to(device)
+        bn.load_state_dict(torch.load(
+            HERE / args.cut_model, map_location=device,
+            weights_only=False)["state_dict"])
+        bn.eval()
+        cut_net = (bn, device)
     rargs = default_read_args(
         font_pool="auto", two_pass=force is not None,
-        hw_priors=args.hw_priors, cut_grid=args.cut_grid)
+        hw_priors=args.hw_priors,
+        cut_grid=None if args.no_cut_grid else args.cut_grid,
+        cut_net=cut_net)
 
     tot_e = tot_n = 0
     for key, img_path, words in load_lines(args.max_lines):
