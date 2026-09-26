@@ -370,6 +370,70 @@ def detect_writer_glyphs(img, T, B, steps, banks,
     return scores
 
 
+_DICT_WORDS = None
+
+
+def _load_dict_words():
+    global _DICT_WORDS
+    if _DICT_WORDS is None:
+        try:
+            _DICT_WORDS = {w.strip().lower() for w in
+                           open("/usr/share/dict/words")}
+        except OSError:
+            _DICT_WORDS = set()
+    return _DICT_WORDS
+
+
+def harvest_self_bank(lines, hw_priors=None, min_conf=0.6,
+                      max_per_char=12, min_per_char=2, size=48):
+    """Self-templates: build a {char: [normalized 48px bitmaps]} bank
+    from a document's own pass-1 reads. `lines` is [(img, T, B, steps)]
+    with steps=[(cur, right, ch, conf)] including space steps.
+
+    Guards against bootstrapping pass-1 errors: only confident letters
+    inside dictionary words, with ink width sane for the char; chars
+    with fewer than min_per_char survivors are left out of the bank
+    (soft verify then passes them through untouched)."""
+    words_ok = _load_dict_words()
+    cands = []
+    for img, T, B, steps in lines:
+        line_h = max(1, B - T)
+        word = []
+        for s in list(steps) + [(0, 0, " ", 1.0)]:
+            if s[2] == " ":
+                wtext = "".join(x[2] for x in word)
+                key = wtext.lower().strip("'\".,;:!?")
+                ok = (key in words_ok) if words_ok else (
+                    wtext.isalpha() and len(wtext) >= 2)
+                if ok and len(wtext) >= 2:
+                    for cur, right, ch, conf in word:
+                        if conf < min_conf or not ch.isalnum():
+                            continue
+                        if hw_priors:
+                            mu = hw_priors["glyph_rel"].get(
+                                ch, 0.55) * line_h
+                            if not (0.5 * mu <= right - cur <= 2.0 * mu):
+                                continue
+                        cands.append((conf, ch, img, T, B, cur, right))
+                word = []
+            else:
+                word.append(s)
+    cands.sort(key=lambda c: -c[0])
+    bank = {}
+    for conf, ch, img, T, B, cur, right in cands:
+        if len(bank.get(ch, ())) >= max_per_char:
+            continue
+        crop = img.crop((cur, T, right, B))
+        arr = np.array(crop.convert("L"))
+        ys, xs = np.where(arr < 200)
+        if len(xs) < 8:
+            continue
+        tight = crop.crop((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+        bank.setdefault(ch, []).append(_glyph_bitmap(tight, size))
+    return {ch: tpls for ch, tpls in bank.items()
+            if len(tpls) >= min_per_char}
+
+
 _FONT_TPL_CACHE = {}
 _FALLBACK_CHARS = string.ascii_letters + string.digits
 
@@ -617,6 +681,8 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
     # candidate char in the KNOWN font and correlating against the actual
     # crop kills these: wrong-glyph correlation is low regardless of width.
     if template_font is not None:
+        soft = getattr(args, "template_soft", False)
+        soft_floor = getattr(args, "template_soft_floor", 0.25)
         dropped = 0
         emptied_t = []
         for idx, (cur, right) in enumerate(meta):
@@ -634,15 +700,30 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
             rescored = []
             for ch, conf in topk:
                 best = 0.0
+                covered = False
                 for variant in {ch, ch.swapcase()}:
                     if isinstance(template_font, dict):
                         # writer bank: {char: [normalized 48px bitmaps]}
-                        for tpl in template_font.get(variant, ()):
+                        tpls = template_font.get(variant, ())
+                        if tpls:
+                            covered = True
+                        for tpl in tpls:
                             best = max(best, float((tpl * target).sum()))
                     else:
                         tpl = _render_glyph(variant, template_font)
                         if tpl is not None:
+                            covered = True
                             best = max(best, float((tpl * target).sum()))
+                if soft:
+                    # partial bank (self-harvested): chars absent from
+                    # the bank pass through untouched; matched chars are
+                    # rescored but never hard-dropped — a thin or
+                    # partly-wrong bank degrades to neutral, not fatal
+                    if covered:
+                        kept.append((ch, conf * max(best, soft_floor)))
+                    else:
+                        kept.append((ch, conf))
+                    continue
                 rescored.append((ch, conf * best, best))
                 if best < args.template_min:
                     dropped += 1
@@ -1006,7 +1087,8 @@ def detection_font_pool(args):
         if f.lower().endswith((".ttf", ".otf", ".ttc")))
 
 
-def read_line(img, model, lm, device, args, verbose=True, force_font=None):
+def read_line(img, model, lm, device, args, verbose=True, force_font=None,
+              return_steps=False):
     """Full two-pass read of one line image (any size, ink located
     automatically). Returns (text, detected_font_or_None, font_score).
     `model` is the eco100 char classifier, `lm` the GPT-2 wrapper — load
@@ -1014,13 +1096,15 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
     font for pass 2 (paragraph-level consensus)."""
     bgc, comp_labels0, comps0 = detect_bg_and_components(img)
     if not comps0:
-        return "", None, 0.0
+        return ("", None, 0.0, [], (0, 0)) if return_steps \
+            else ("", None, 0.0)
     xs = [c["bbox"][0] for c in comps0] + [c["bbox"][2] for c in comps0]
     ys = [c["bbox"][1] for c in comps0] + [c["bbox"][3] for c in comps0]
     L, T, R, B = min(xs), min(ys), max(xs), max(ys)
     line_h = B - T
     if line_h < 6 or R - L < 6:
-        return "", None, 0.0
+        return ("", None, 0.0, [], (0, 0)) if return_steps \
+            else ("", None, 0.0)
 
     hw_priors = getattr(args, "hw_priors", None)
     if hw_priors:
@@ -1045,7 +1129,8 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
                             glyph_widths, space_w, width_cap=None,
                             verbose=verbose)
     if not completes:
-        return "", None, 0.0
+        return ("", None, 0.0, [], (0, 0)) if return_steps \
+            else ("", None, 0.0)
     hyp = completes[0][1][len(args.context):].rstrip()
     det_font = None
     font_score = 0.0
@@ -1120,6 +1205,9 @@ def read_line(img, model, lm, device, args, verbose=True, force_font=None):
         # writer-ID mode: report the hashable writer key (the analog of
         # a font path) so callers can vote on it; the bank stays internal
         det_font = writer_key
+    if return_steps:
+        return (fixed, det_font, font_score,
+                unwind_path(completes[0][5]), (T, B))
     return fixed, det_font, font_score
 
 
@@ -1133,7 +1221,8 @@ def default_read_args(**overrides):
              max_expansions=400000, max_completes=10, cursor_beam=32,
              pop_batch=8, context="", gpu_batch=128, ascii_only=True,
              hw_priors=None, cut_grid=None, writer_banks=None,
-             cut_net=None, cut_net_thresh=0.3)
+             cut_net=None, cut_net_thresh=0.3, template_soft=False,
+             template_soft_floor=0.25)
     d.update(overrides)
     return argparse.Namespace(**d)
 
