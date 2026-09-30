@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--cut-model", default=None,
                     help="BoundaryNet checkpoint; replaces/augments cuts")
     ap.add_argument("--no-cut-grid", action="store_true")
+    ap.add_argument("--divider-model", default=None,
+                    help="ColCharNet ckpt for divider-descent cuts")
     ap.add_argument("--self-templates", action="store_true",
                     help="two-pass with per-DOCUMENT self-harvested "
                          "template banks (pass-1 confident letters in "
@@ -108,18 +110,23 @@ def main():
             weights_only=False)["state_dict"])
         bn.eval()
         cut_net = (bn, device)
+    divider_net = None
+    if args.divider_model:
+        from divider_descent import load_colchar
+        divider_net = (load_colchar(HERE / args.divider_model, device),
+                       device)
     rargs = default_read_args(
         font_pool="auto",
         two_pass=(force is not None) and not args.self_templates,
         hw_priors=args.hw_priors,
         cut_grid=None if args.no_cut_grid else args.cut_grid,
-        cut_net=cut_net)
+        cut_net=cut_net, divider_net=divider_net)
     rargs2 = default_read_args(
         font_pool="auto", two_pass=True, template_soft=True,
         template_soft_floor=0.5,
         hw_priors=args.hw_priors,
         cut_grid=None if args.no_cut_grid else args.cut_grid,
-        cut_net=cut_net)
+        cut_net=cut_net, divider_net=divider_net)
     priors = json.load(open(HERE / args.hw_priors)) \
         if args.hw_priors else None
 

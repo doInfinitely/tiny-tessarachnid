@@ -546,6 +546,18 @@ def decode_line(img, box, model, lm, device, args, glyph_widths, space_w,
                     and probs[c] >= probs[c + 1]):
                 proposed.append(L + int(round(c / sc)))
         cuts = sorted(set(cuts) | set(proposed))
+    # differentiable divider descent: jointly-optimized divider
+    # hypotheses from the column-char response matrix
+    div_net = getattr(args, "divider_net", None)
+    if div_net is not None:
+        from divider_descent import propose_cuts
+        dnet, ddev = div_net
+        band = np.array(img.convert("L").crop((L, T, R, B)),
+                        dtype=np.float32)
+        blo, bbg = band.min(), np.percentile(band, 90)
+        band = np.clip((band - blo) / max(1.0, bbg - blo), 0, 1)
+        dcuts = [L + c for c in propose_cuts(dnet, band, ddev)]
+        cuts = sorted(set(cuts) | set(dcuts))
 
     # ---- space candidate edges from zero-ink runs ----
     runs = gap_runs(comp_labels, L, R, T, B)
@@ -1221,7 +1233,8 @@ def default_read_args(**overrides):
              max_expansions=400000, max_completes=10, cursor_beam=32,
              pop_batch=8, context="", gpu_batch=128, ascii_only=True,
              hw_priors=None, cut_grid=None, writer_banks=None,
-             cut_net=None, cut_net_thresh=0.3, template_soft=False,
+             cut_net=None, cut_net_thresh=0.3, divider_net=None,
+             template_soft=False,
              template_soft_floor=0.25)
     d.update(overrides)
     return argparse.Namespace(**d)
